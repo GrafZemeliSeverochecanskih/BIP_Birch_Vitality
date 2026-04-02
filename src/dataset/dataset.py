@@ -36,10 +36,20 @@ def filter_trees_with_images(
     
     return df_filtered
 
-def get_transforms(mode, image_size):
+def get_transforms(mode, image_size, augmentation="light"):
     mean = [0.485, 0.456, 0.406]
     std = [0.229, 0.224, 0.225]
-    if mode == "train":
+    if mode == "train" and augmentation == "light":
+        return transforms.Compose(
+            [
+                transforms.Resize([image_size, image_size]),
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.ColorJitter(brightness=0.2, contrast=0.2),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=mean, std=std)
+            ]
+        )
+    if mode == "train" and augmentation == "heavy":
         return transforms.Compose([
  
             transforms.RandomResizedCrop(
@@ -88,7 +98,8 @@ class BirchDataset(Dataset):
         image_dir,
         mode="train",
         image_size=224,
-        image_extension=".jpg"
+        image_extension=".jpg",
+        augmentation="light"
     ):
         self.df = df.reset_index(drop=True)
         self.image_dir = image_dir
@@ -150,9 +161,10 @@ def build_dataloaders(
     batch_size=16,
     num_workers=0,
     image_size=224,
+    augmentation="light"
 ):
-    train_dataset = BirchDataset(train_df, image_dir, mode="train", image_size=image_size)
-    val_dataset = BirchDataset(val_df, image_dir, mode="val", image_size=image_size)
+    train_dataset = BirchDataset(train_df, image_dir, mode="train", image_size=image_size, augmentation=augmentation)
+    val_dataset = BirchDataset(val_df, image_dir, mode="val", image_size=image_size, augmentation=augmentation)
     
     train_loader = DataLoader(
         train_dataset, 

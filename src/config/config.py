@@ -3,30 +3,32 @@ from pathlib import Path
 
 @dataclass
 class ModelConfig:
-    backbone: str = "efficientnet_b0"
+    backbone: str = "vit_base_patch16_224"
     aggregator: str = "attention"
     hidden_dim: int = 256
     dropout: float = 0.3
     pretrained: bool = True
-    freeze_backbone: bool = False
+    freeze_backbone: bool = True
     
 @dataclass
 class TrainConfig:
     epochs: int = 50
     batch_size: int = 4
-    lr: float = 0.001
-    weight_decay: float = 0.001
+    lr: float = 5e-5
+    weight_decay: float = 0.0001
     patience: int = 10
-    cv_folds: int = 5
+    cv_folds: int = 3
+    resume: bool = True
     
     
 @dataclass
 class DataConfig:
     image_size: int = 224
-    num_workers: int = 0
+    num_workers: int = 2
     image_extensions: tuple = (".jpg", ".jpeg", ".png")
     csv_encoding: str = "cp1250"
     csv_sep: str = ";"
+    augmentation: str = "light" 
 
 @dataclass
 class PathConfig:
@@ -34,8 +36,8 @@ class PathConfig:
     image_dir: Path = Path("data")
     csv_path: Path = Path("data/birch_trees_bratislava.csv")
     output_dir: Path = Path("outputs")
-    checkpoint_dir: Path = Path("outputs/checkpoints")
-    log_dir: Path = Path("outputs/logs")
+    checkpoint_dir: Path = None
+    log_dir: Path = None
 
 @dataclass
 class Config:
@@ -53,6 +55,13 @@ class Config:
             self.data = DataConfig()
         if self.paths is None:
             self.paths = PathConfig()
+        
+        model_tag = f"{self.model.backbone}_{self.model.aggregator}"
+        if self.paths.checkpoint_dir is None:
+            self.paths.checkpoint_dir = Path(f"outputs/{model_tag}/checkpoints")
+        if self.paths.log_dir is None:
+            self.paths.log_dir = Path(f"outputs/{model_tag}/logs")
+        
 
         self.paths.output_dir.mkdir(parents=True,exist_ok=True)
         self.paths.checkpoint_dir.mkdir(parents=True,exist_ok=True)
@@ -78,12 +87,15 @@ class Config:
         print(f"image_size: {self.data.image_size}")
         print(f"image_dir: {self.paths.image_dir}")
         print(f"csv_path: {self.paths.csv_path}")
+        print(f"checkpoint_dir: {self.paths.checkpoint_dir}")
+        print(f"log_dir: {self.paths.log_dir}")
+        
         print("="*40)
 
 class EfficientNetAttention(Config):
     def __post_init__(self):
         self.model = ModelConfig(
-            backbone="efficientnet_b0",
+            backbone="efficientnet_b2",
             aggregator="attention"
         )
         self.training = TrainConfig()

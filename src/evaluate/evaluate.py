@@ -58,7 +58,8 @@ def run_cv(df, config):
             config.paths.image_dir,
             batch_size = config.training.batch_size,
             num_workers = config.data.num_workers,
-            image_size = config.data.image_size
+            image_size = config.data.image_size,
+            augmentation=config.data.augmentation
         )
         
         model = BirchVitalityModel(

@@ -20,6 +20,22 @@ def r2_score(preds, targets):
         return 0.0
     return (1 - ss_res/ss_tot).item()
 
+def save_checkpoint(path, model, optimizer, scheduler, epoch, best_loss):
+    torch.save({
+        "epoch":epoch,
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "scheduler_state": scheduler.state_dict(),
+        "best_loss": best_loss,
+    }, path)
+
+def load_checkpoint(path, model, optimizer, scheduler):
+    checkpoint = torch.load(path, weights_only=False)
+    model.load_state_dict(checkpoint["model_state"])
+    optimizer.load_state_dict(checkpoint["optimizer_state"])
+    scheduler.load_state_dict(checkpoint["scheduler_state"])
+    return checkpoint["epoch"], checkpoint["best_loss"]
+
 def train_epoch(
     model,
     loader,
@@ -157,7 +173,17 @@ def train_fold(
           f"{'Val Loss':>9} | {'Val MAE':>9} | {'Val R^2':>8} |")
     print("="*70)
     
-    for epoch in range(1, config.training.epochs + 1):
+    start_epoch = 1
+    resume_path = config.paths.checkpoint_dir / f"fold_{fold}_resume.pt"
+
+    if resume_path.exists():
+        print(f"Resume fold {fold} from {resume_path}")
+        start_epoch, best_loss = load_checkpoint(resume_path, model, optimizer, scheduler)
+        early_stopping.best_loss = best_loss
+        start_epoch += 1
+        print(f"Resume from epoch {start_epoch - 1}")
+
+    for epoch in range(start_epoch, config.training.epochs + 1):
         t0 = time.time()
         train_metrics = train_epoch(model, train_loader, optimizer, criterion, device)
         val_metrics = val_epoch(model, val_loader, criterion, device)
@@ -190,6 +216,9 @@ def train_fold(
                   f"(best val loss: {early_stopping.best_loss:.4f})"
                   )
             break
+        
+        save_checkpoint(resume_path, model, optimizer, scheduler, epoch, early_stopping.best_loss)
+
     if checkpoint_path.exists():
         model.load_state_dict(torch.load(checkpoint_path, weights_only=True))
         print(f"Loaded best weights from {checkpoint_path}")
@@ -204,9 +233,6 @@ def train_fold(
     }
     
 if __name__ == "__main__":
-    import sys
-    sys.path.append(str(Path(__file__).resolve().parents[1]))
-    from model.model import BirchVitalityModel
     print("train.py sanity check")
     print("="*40)
     
