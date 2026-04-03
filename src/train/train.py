@@ -47,12 +47,13 @@ def train_epoch(
     all_preds = list()
     all_targets = list()
     total_loss = 0.0
-    
     n_batches = 0
+
     for batch in loader:
         images = [img.to(device) for img in batch["images"]]
         targets = batch["vitality"].to(device)
-        
+        tabular = batch["tabular"].to(device) if "tabular" in batch else None
+
         optimizer.zero_grad()
         preds = model(images)
         loss = criterion(preds, targets)
@@ -83,12 +84,13 @@ def val_epoch(
     all_preds = list()
     all_targets = list()
     total_loss = 0.0
-    
+    n_batches = 0
+
     with torch.no_grad():
-        n_batches = 0
         for batch in loader:
             images = [img.to(device) for img in batch["images"]]
             targets = batch["vitality"].to(device)
+            tabular = batch["tabular"].to(device) if "tabular" in batch else None
             
             preds = model(images)
             loss = criterion(preds, targets)

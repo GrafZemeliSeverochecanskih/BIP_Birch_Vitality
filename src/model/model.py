@@ -81,6 +81,73 @@ def get_aggregator(name, feature_dim):
     print(f"Using aggregator: {name}")
     return aggreagators[name]
 
+class DINOSegmenter(nn.Module):
+    def __init__(
+        self,
+        model_name="vit_small_patch16_224.dino",
+        threshold=0.6,
+    ):
+        super().__init__()
+        self.vit = timm.create_model(
+            model_name,
+            pretrained=True,
+            num_classes=0
+        )
+        for p in self.vit.parameters():
+            p.requires_grad = False
+        self.vit.eval()
+        
+        ps = self.vit.patch_embed.patch_size
+        self.patch_size = ps[0] if isinstance(ps, (tuple, list)) else int(ps)
+        self.threshold = threshold
+        self._attn: torch.Tensor | None = None
+        
+        last_block = self.vit.blocks[-1]
+        last_block.attn.fused_attn = False
+        
+        def _capture_attn(module, input, output):
+            self._attn = input[0].detach()
+        
+        last_block.attn.attn_drop.register_forward_hook(_capture_attn)
+        print(f"DINO segmenter: {model_name} | threshold {threshold} | patch size {self.patch_size}")
+    
+    @torch.no_grad()
+    def forward(self, images: torch.Tensor):
+        B, C, H, W = images.shape
+        h_p = H // self.patch_size
+        w_p = W // self.patch_size
+        
+        self.vit(images)
+        
+        attn = self._attn
+        cls_attn = attn[:, :, 0, -1]
+        cls_attn = cls_attn.reshape(B, h_p, w_p)
+        
+        a_min = cls_attn.flatten(1).min(dim=1)[0].view(B, 1, 1)
+        a_max = cls_attn.flatten(1).max(dim=1)[0].view(B, 1, 1)
+        
+        cls_attn = (cls_attn - a_min) / (a_max - a_min + 1e-8)
+        mask = (cls_attn > self.threshold).float().unsqueeze(1)
+        mask = F.interpolate(mask, size=(H, W), mode="nearest")
+        
+        return images * mask
+
+        
+class TabularEncoder(nn.Module):
+    def __init__(self, n_features, hidden_dim, out_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_features, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, out_dim),
+            nn.ReLU(),
+        )
+        print(f"TabularEncoder: {n_features} -> {hidden_dim} -> {out_dim}")
+
+    def forward(self, x):
+        return self.net(x)
+
+
 class RegressionHead(nn.Module):
     def __init__(self, feature_dim, hidden_dim=256, dropout=0.3):
         super().__init__()
@@ -124,26 +191,72 @@ class BirchVitalityModel(nn.Module):
         hidden_dim=256,
         dropout=0.3,
         pretrained=True,
-        freeze_backbone=False
+        freeze_backbone=False,
+
+        use_dino = False,
+        dino_seg_model: str = "vit_small_patch16_224.dino",
+        dino_seg_threshold: float = 0.6,
+
+        use_tabular: bool = False,
+        n_tabular_features: int = 0,
+        tabular_hidden_dim: int = 64 
     ):
         super().__init__()
+
+        self.segmenter = (
+            DINOSegmenter(dino_seg_model, dino_seg_threshold) if use_dino_seg else None
+        )
+
         self.backbone, feature_dim = get_backbone(backbone_name, pretrained)
         self.aggregator = get_aggregator(aggregator_name, feature_dim)
-        self.regression_head = RegressionHead(feature_dim, hidden_dim, dropout)
 
         if freeze_backbone:
             for param in self.backbone.parameters():
                 param.requires_grad = False
             print("Backbone frozen. Only aggregator and regression head will be trained.")
-            
-    def forward_single(self, images):
+        
+        tabular_out_dim = 0
+        self.tabular_encoder = None
+        if use_tabular and n_tabular_features > 0:
+            tabular_out_dim = tabular_hidden_dim
+            self.tabular_encoder = TabularEncoder(
+                n_tabular_features, tabular_hidden_dim, tabular_out_dim
+            )
+
+        self.regression_head = RegressionHead(
+            feature_dim + tabular_out_dim, hidden_dim, dropout
+        )
+
+    def forward_single(
+        self, 
+        images,
+        tabular
+        ):
+        if self.segmenter is not None:
+            images = self.segmenter(images)
+
         features = self.backbone(images.to(next(self.parameters()).device))  # (N, feature_dim)
         aggregated = self.aggregator(features)  # (feature_dim,)
+
+        if self.tabular_encoder is not None and tabular is not None:
+            tab_emb = self.tabular_encoder(tabular)
+            aggregated = torch.cat([aggregated, tab_emb], dim = -1)
+
         prediction = self.regression_head(aggregated)  # (1,)
         return prediction
     
-    def forward(self, images):
-        predictions = [self.forward_single(imgs) for imgs in images]
+    def forward(
+        self, 
+        images,
+        tabular
+        ):
+        if tabular is not None:
+            predictions = [
+                self.forward_single(images, tab)
+                for images, tab in zip(images, tabular)
+            ]
+        else:
+            predictions = [self.forward_single(imgs) for imgs in images]
         return torch.stack(predictions)
     
     def unfreeze_backbone(self):
@@ -156,14 +269,20 @@ class BirchVitalityModel(nn.Module):
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         return {"total": total, "trainable": trainable, "frozen": total - trainable}
     
-def build_model(cfg: Config):
+def build_model(cfg: Config, n_tabular_features: int):
     return BirchVitalityModel(
         backbone_name=cfg.model.get("backbone", "efficientnet_b0"),
         aggregator_name=cfg.model.get("aggregator", "attention"),
         hidden_dim=cfg.model.get("hidden_dim", 256),
         dropout=cfg.model.get("dropout", 0.3),
         pretrained=cfg.model.get("pretrained", True),
-        freeze_backbone=cfg.model.get("freeze_backbone", False)
+        freeze_backbone=cfg.model.get("freeze_backbone", False),
+        use_dino_seg = cfg.model.get("use_dino_seg", False),
+        dino_seg_model = cfg.model.get("dino_segmentation_model", "vit_small_patch16_224.dino"),
+        dino_seg_threshold = cfg.model.get("dino_segmenation_threshold", 0.6),
+        use_tabular = cfg.model.get("use_tabular", False),
+        n_tabular_features = n_tabular_features,
+        tabular_hidden_dim = cfg.model.get("tabular_hidden_dim", 64)
     )
 
 if __name__ == "__main__":

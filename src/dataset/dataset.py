@@ -90,7 +90,15 @@ def get_transforms(mode, image_size, augmentation="light"):
             transforms.ToTensor(),
             transforms.Normalize(mean=mean, std=std)
         ])
-    
+
+def compute_tabular_stats(
+    df, 
+    features
+):
+    mean = {f: float(df[f].mean()) for f in features}
+    std = {f: float(df[f].std()) for f in features}
+    return mean, std
+
 class BirchDataset(Dataset):
     def __init__(
         self,
@@ -98,13 +106,20 @@ class BirchDataset(Dataset):
         image_dir,
         mode="train",
         image_size=224,
-        image_extension=".jpg",
-        augmentation="light"
+        image_extension=(".jpg", ".jpeg", ".png"),
+        augmentation="light",
+        tabular_features= (),
+        tabular_mean = None,
+        tabular_std = None
     ):
         self.df = df.reset_index(drop=True)
         self.image_dir = image_dir
         self.transform = get_transforms(mode, image_size)
         self.extensions = image_extension
+        self.image_paths = self._index_to_images()
+        self.tabular_features = tabular_features
+        self.tabular_mean = tabular_mean or {f: 0.0 for f in tabular_features}
+        self.tabular_std = tabular_std or {f: 1.0 for f in tabular_features}
         self.image_paths = self._index_to_images()
     
     def _index_to_images(self):
@@ -137,6 +152,15 @@ class BirchDataset(Dataset):
         
         images = torch.stack(images)
         
+        if self.tabular_features:
+            tab = []
+            for feat in self.tabular_features:
+                val =float(row[feat]) if pd.notna(row.get(feat)) else 0.0
+                mean = self.tabular_mean.get(feat, 0.0)
+                std = self.tabular_mean.get(feat, 1.0)
+                tab.append((val - mean) / (std + 1e-8))
+            item["tabular"] = torch.tensor(tab, dtype=torch.float32)
+        
         return {
             "images": images,
             "vitality": vitality,
@@ -148,11 +172,16 @@ def collate_fn(batch):
     Custom collate to handle variable-length image bags.
     Returns images as a list of tensors instead of a stacked tensor.
     """
-    return {
+    out = {
         "images": [item["images"] for item in batch],
         "vitality": torch.stack([item["vitality"] for item in batch]),
         "tree_id": [item["tree_id"] for item in batch]
     }
+
+    if "tabular" in batch[0]:
+        out["tabular"] = torch.stack([item["tabular"] for item in batch])
+    
+    return out
     
 def build_dataloaders(
     train_df,
@@ -161,10 +190,24 @@ def build_dataloaders(
     batch_size=16,
     num_workers=0,
     image_size=224,
-    augmentation="light"
+    augmentation="light",
+    tabular_features = tuple(),
+    image_extensions = (".jpg", ".jpeg", ".png"),
+    tabular_mean = None,
+    tabular_std = None,
 ):
-    train_dataset = BirchDataset(train_df, image_dir, mode="train", image_size=image_size, augmentation=augmentation)
-    val_dataset = BirchDataset(val_df, image_dir, mode="val", image_size=image_size, augmentation=augmentation)
+    shared = dict(
+        image_dir = image_dir,
+        image_size = image_size,
+        augmentation = augmentation,
+        tabular_features = tabular_features,
+        tabular_mean = tabular_mean,
+        tabular_std = tabular_std,
+        image_extensions = image_extensions    
+    )
+
+    train_dataset = BirchDataset(train_df, **shared, mode="train", augmentation=augmentation)
+    val_dataset = BirchDataset(val_df, **shared, mode="val", augmentation=augmentation)
     
     train_loader = DataLoader(
         train_dataset, 

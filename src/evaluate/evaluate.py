@@ -1,3 +1,4 @@
+from dataset.dataset import compute_tabular_stats
 from pathlib import Path
 
 import numpy as np
@@ -47,46 +48,63 @@ def run_cv(df, config):
         train_df = df.iloc[train_idx].reset_index(drop=True)
         val_df = df.iloc[val_idx].reset_index(drop=True)
         
-        stats = train_df['vitality'].describe()[['mean', 'std', 'min', 'max']].to_dict()
-        print(f"Train vitality: {stats}")
-        stats = val_df['vitality'].describe()[['mean', 'std', 'min', 'max']].to_dict()
-        print(f"Val vitality: {stats}")
-        
+        tabular_mean, tabular_std = dict(), dict()
+
+        if config.model.use_tabular and config.model.tabular_features:
+            tabular_mean, tabular_std = compute_tabular_stats(
+                train_df, config.model.tabular_features
+            )
+            print(f"Tabular stats: {tabular_mean}")
+
         train_loader, val_loader = build_dataloaders(
             train_df,
             val_df,
-            config.paths.image_dir,
+            image_dir = config.paths.image_dir,
             batch_size = config.training.batch_size,
             num_workers = config.data.num_workers,
             image_size = config.data.image_size,
-            augmentation=config.data.augmentation
+            image_extensions=config.data.image_extensions,
+            augmentation=config.data.augmentation,
+            tabular_mean=tabular_mean,
+            tabular_std=tabular_std,
+            tabular_features=config.model.tabular_features
         )
         
+        n_tab = len(config.model.tabular_features) if config.model.use_tabular else 0
+
         model = BirchVitalityModel(
             backbone_name = config.model.backbone,
             aggregator_name = config.model.aggregator,
             hidden_dim = config.model.hidden_dim,
             dropout = config.model.dropout,
             pretrained = config.model.pretrained,
-            freeze_backbone = config.model.freeze_backbone
+            freeze_backbone = config.model.freeze_backbone,
+            use_dino=config.model.use_dino_segmentation,
+            dino_seg_threshold=config.model.dino_seg_threshold,
+            dino_seg_model=config.model.dino_seg_model,
+            use_tabular=config.model.use_tabular,
+            n_tabular_features=n_tab,
+            tabular_hidden_dim=config.model.tabular_hidden_dim
         )
         
-        result = train_fold(
-            model = model,
-            train_loader=train_loader,
-            val_loader=val_loader,
-            config=config,
-            fold=fold,
-            device=device
-        )
+        result = train_fold(model, train_loader, val_loader, config, fold, device)
         fold_results.append({
             "fold": fold,
             "best_val_loss": result["best_val_loss"],
             "best_val_mae": result["best_val_mae"],
             "best_val_r2": result["best_val_r2"],
-            "best_epoch": result["best_epoch"]
+            "best_epoch": result["best_epoch"],
+            "tabular_mean": str(tabular_mean),
+            "tabular_std": str(tabular_std),
         })
+        
         all_histories.append(result["history"])
+
+        stats = train_df['vitality'].describe()[['mean', 'std', 'min', 'max']].to_dict()
+        print(f"Train vitality: {stats}")
+        stats = val_df['vitality'].describe()[['mean', 'std', 'min', 'max']].to_dict()
+        print(f"Val vitality: {stats}")
+        
         print(f"Fold {fold} best ->"
             f"loss: {result['best_val_loss']:.4f} |"
             f"MAE: {result['best_val_mae']:.4f} |"

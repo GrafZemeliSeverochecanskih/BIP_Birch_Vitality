@@ -58,7 +58,24 @@ def main(config=None):
     
     best_fold = min(results["fold_results"], key=lambda x: x["best_val_mae"])
     best_fold_idx = best_fold["fold"]
+    
+    import json
+    if config.model.use_tabular:
+        best_fold_data = next(
+            r for r in results["fold_results"] if r["fold"] == best_fold_idx
+        )
+        tab_stats = {
+            "features" : list(config.model.tabular_features),
+            "mean": eval(best_fold_data["tabular_mean"]),
+            "std": eval(best_fold_data["tabular_std"])
+        }
 
+        stats_path = config.paths.output_dir / "tabular_stats.json"
+        with open(stats_path, "w") as f:
+            json.dump(tab_stats, f, indent=2)
+        print(f"Tabular stats saved to {stats_path}")
+
+    
     import shutil
     best_src  = config.paths.checkpoint_dir / f"fold_{best_fold_idx}_best.pt"
     best_dst  = config.paths.checkpoint_dir / "best_model.pt"

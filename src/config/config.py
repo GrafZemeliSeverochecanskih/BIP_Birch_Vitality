@@ -10,6 +10,14 @@ class ModelConfig:
     pretrained: bool = True
     freeze_backbone: bool = True
     
+    use_dino_segmentation: bool = False
+    dino_segmentation_model: str = "vit_small_patch16_224.dino"
+    dino_segmenation_threshold: float = 0.6
+    
+    use_tabular: bool = False
+    tabular_features: tuple = ("cirmumference_cm", )
+    tabular_hidden_dim: int = 64
+    
 @dataclass
 class TrainConfig:
     epochs: int = 50
@@ -57,6 +65,11 @@ class Config:
             self.paths = PathConfig()
         
         model_tag = f"{self.model.backbone}_{self.model.aggregator}"
+        if self.model.use_dino_segmentation:
+            model_tag += "_dino_segmentation"
+        if self.model.use_tabular:
+            model_tag += "_tabular"
+        
         if self.paths.checkpoint_dir is None:
             self.paths.checkpoint_dir = Path(f"outputs/{model_tag}/checkpoints")
         if self.paths.log_dir is None:
@@ -76,6 +89,14 @@ class Config:
         print(f"hidden_dim: {self.model.hidden_dim}")
         print(f"dropout: {self.model.dropout}")
         print(f"freeze_backbone: {self.model.freeze_backbone}")
+        print(f"use_dino_segmentation: {self.model.use_dino_segmentation}")
+        if self.model.use_dino_segmentation:
+            print(f"dino_segmentation_model: {self.model.dino_segmentation_model}")
+            print(f"dino_segmenation_threshold: {self.model.dino_segmenation_threshold}")
+        print(f"use_tabular: {self.model.use_tabular}")
+        if self.model.use_tabular:
+            print(f"tabular_features: {self.model.tabular_features}")
+            print(f"tabular_hidden_dim: {self.model.tabular_hidden_dim}")
         print("="*40)
         print(f"epochs: {self.training.epochs}")
         print(f"batch_size: {self.training.batch_size}")
@@ -125,7 +146,50 @@ class ViTAttention(Config):
         self.data = DataConfig()
         self.paths = PathConfig()
         super().__post_init__()
-        
+
+class DINOBackbone(Config):
+    def __post_init__(self):
+        self.model = ModelConfig(
+            backbone="vit_small_patch16_224.dino",
+            aggregator="attention",
+            use_dino_segmentation=True,
+            dino_segmentation_model="vit_small_patch16_224.dino",
+            dino_segmenation_threshold=0.6
+        )
+        self.training = TrainConfig()
+        self.data = DataConfig()
+        self.paths = PathConfig()
+        super().__post_init__()
+
+class WithTabular(Config):
+    def __post_init__(self):
+        self.model = ModelConfig(
+            backbone="vit_small_patch16_224",
+            aggregator="attention",
+            use_tabular=True,
+            tabular_features=("cirmumference_cm",),
+            tabular_hidden_dim=64
+        )
+        self.training = TrainConfig()
+        self.data = DataConfig()
+        self.paths = PathConfig()
+        super().__post_init__()
+
+class DINOWithTabular(Config):
+    def __post_init__(self):
+        self.model = ModelConfig(
+            backbone="vit_small_patch16_224.dino",
+            aggregator="attention",
+            use_dino_segmentation=True,
+            use_tabular=True,
+            tabular_features=("cirmumference_cm", "fungal_infection"),
+            tabular_hidden_dim=64
+        )
+        self.training = TrainConfig()
+        self.data = DataConfig()
+        self.paths = PathConfig()
+        super().__post_init__()
+
 if __name__ == "__main__":
     cfg = Config()
     cfg.display()

@@ -23,7 +23,7 @@ def evaluate_test(config=None):
     test_csv_path = config.paths.output_dir / "test_set.csv"
     if not test_csv_path.exists():
         raise FileNotFoundError(
-            f"Test set not found at {test_csv_path}"
+            f"Test set not found at {test_csv_path}\n"
             "Run main.py first to generate the test split."
         )
 
@@ -31,11 +31,26 @@ def evaluate_test(config=None):
     print(f"Test set: {len(df_test)} trees")
     print(f"Vitality distribution:\n{df_test['vitality'].describe().round(3)}\n")
 
+    
+    import json 
+    tabular_features, tabular_mean, tabular_std = (), {}, {}
+    if config.model.use:
+        stats_path = config.paths.output_dir / "tabular_stats.json"
+        with open(stats_path) as f:
+            tab_stats = json.load(f)
+        tabular_features = tuple(tab_stats["features"])
+        tabular_mean = tab_stats["mean"]
+        tabular_std = tab_stats["std"]
+        print(f"Loaded tabular stats: {tabular_mean}")
+        
     test_dataset = BirchDataset(
         df_test,
         config.paths.image_dir,
         mode="val",
-        image_size=config.data.image_size
+        image_size=config.data.image_size,
+        tabular_features=tabular_features,
+        tabular_mean=tabular_mean,
+        tabular_std=tabular_std
     )
 
     test_loader = DataLoader(
@@ -49,7 +64,7 @@ def evaluate_test(config=None):
     checkpoint_path = config.paths.checkpoint_dir / "best_model.pt"
     if not checkpoint_path.exists():
         raise FileNotFoundError(
-            f"Best model not found at {checkpoint_path}"
+            f"Best model not found at {checkpoint_path}\n"
             "Run main.py first to train the model"
         )
     
