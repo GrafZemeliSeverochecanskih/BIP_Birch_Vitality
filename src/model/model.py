@@ -204,7 +204,7 @@ class BirchVitalityModel(nn.Module):
         super().__init__()
 
         self.segmenter = (
-            DINOSegmenter(dino_seg_model, dino_seg_threshold) if use_dino_seg else None
+            DINOSegmenter(dino_seg_model, dino_seg_threshold) if use_dino else None
         )
 
         self.backbone, feature_dim = get_backbone(backbone_name, pretrained)
@@ -252,11 +252,11 @@ class BirchVitalityModel(nn.Module):
         ):
         if tabular is not None:
             predictions = [
-                self.forward_single(images, tab)
-                for images, tab in zip(images, tabular)
+                self.forward_single(imgs, tab)
+                for imgs, tab in zip(images, tabular)
             ]
         else:
-            predictions = [self.forward_single(imgs) for imgs in images]
+            predictions = [self.forward_single(imgs, None) for imgs in images]
         return torch.stack(predictions)
     
     def unfreeze_backbone(self):

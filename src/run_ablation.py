@@ -1,15 +1,3 @@
-"""
-Ablation study: DINO segmentation × Tabular features for ViT model.
-
-Runs 4 configurations:
-  1. ViT baseline           (no DINO, no tabular)
-  2. ViT + DINO             (DINO segmentation, no tabular)
-  3. ViT + Tabular          (no DINO, tabular features)
-  4. ViT + DINO + Tabular   (DINO segmentation + tabular features)
-
-Results (per-fold and summary) are saved to  outputs/ablation_results.csv
-"""
-
 import sys
 import time
 from pathlib import Path
@@ -25,7 +13,6 @@ from dataset.dataset import filter_trees_with_images
 from evaluate.evaluate import run_cv, make_vitality_bins
 from sklearn.model_selection import train_test_split
 
-# ── Column renaming (same as main.py) ────────────────────────────────
 COLUMN_NAME = {
     "N (°)": "N",
     "E (°)": "E",
@@ -34,7 +21,6 @@ COLUMN_NAME = {
     "fungal infection (3 - worst)": "fungal_infection",
 }
 
-# ── Ablation configurations ──────────────────────────────────────────
 ABLATION_CONFIGS = [
     {
         "name": "ViT_baseline",
@@ -60,13 +46,9 @@ ABLATION_CONFIGS = [
 
 
 def build_ablation_config(ablation: dict) -> Config:
-    """Create a Config for the given ablation setting."""
-
     use_dino = ablation["use_dino_segmentation"]
     use_tab = ablation["use_tabular"]
 
-    # Use DINO backbone when DINO segmentation is enabled,
-    # otherwise use standard ViT small
     backbone = "vit_small_patch16_224.dino" if use_dino else "vit_small_patch16_224"
 
     model_cfg = ModelConfig(
@@ -91,14 +73,11 @@ def build_ablation_config(ablation: dict) -> Config:
 
 
 def run_ablation():
-    """Run all ablation experiments and save results to CSV."""
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
     print(f"Starting ablation at {datetime.now().isoformat()}")
     print("=" * 60)
 
-    # ── Load & prepare data (once) ────────────────────────────────
     base_cfg = Config()
     df = pd.read_csv(
         base_cfg.paths.csv_path,
@@ -119,18 +98,17 @@ def run_ablation():
         random_state=42,
         stratify=make_vitality_bins(df_filtered["vitality"]),
     )
-    print(f"Train/val: {len(df_train_val)} trees  |  Test hold-out: {len(df_test)} trees")
+    print(f"Train/val: {len(df_train_val)} trees | Test hold-out: {len(df_test)} trees")
     print("=" * 60)
 
-    # ── Run each ablation ─────────────────────────────────────────
     all_rows = []
 
     for ablation in ABLATION_CONFIGS:
         name = ablation["name"]
         print("\n" + "█" * 60)
-        print(f"  ABLATION: {name}")
-        print(f"  DINO segmentation : {ablation['use_dino_segmentation']}")
-        print(f"  Tabular features  : {ablation['use_tabular']}")
+        print(f"ABLATION: {name}")
+        print(f"DINO segmentation : {ablation['use_dino_segmentation']}")
+        print(f"Tabular features: {ablation['use_tabular']}")
         print("█" * 60 + "\n")
 
         cfg = build_ablation_config(ablation)
@@ -142,7 +120,6 @@ def run_ablation():
 
         summary = results["summary"]
 
-        # Per-fold rows
         for fr in results["fold_results"]:
             all_rows.append({
                 "experiment": name,
@@ -156,7 +133,6 @@ def run_ablation():
                 "type": "fold",
             })
 
-        # Summary row
         all_rows.append({
             "experiment": name,
             "use_dino": ablation["use_dino_segmentation"],
@@ -169,11 +145,10 @@ def run_ablation():
             "type": "summary",
         })
 
-        print(f"\n  ✓ {name} completed in {elapsed/60:.1f} min")
-        print(f"    MAE  = {summary['mean_val_mae']:.4f} ± {summary['std_val_mae']:.4f}")
-        print(f"    R²   = {summary['mean_val_r2']:.4f} ± {summary['std_val_r2']:.4f}")
+        print(f"\n {name} completed in {elapsed/60:.1f} min")
+        print(f"MAE = {summary['mean_val_mae']:.4f} ± {summary['std_val_mae']:.4f}")
+        print(f"R^2 = {summary['mean_val_r2']:.4f} ± {summary['std_val_r2']:.4f}")
 
-    # ── Save results ──────────────────────────────────────────────
     results_df = pd.DataFrame(all_rows)
     output_path = Path("outputs") / "ablation_results.csv"
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -184,7 +159,6 @@ def run_ablation():
     print("=" * 60)
     print(f"Results saved to {output_path.resolve()}")
 
-    # ── Print compact comparison table ────────────────────────────
     summary_df = results_df[results_df["type"] == "summary"][
         ["experiment", "use_dino", "use_tabular", "val_mae", "val_r2"]
     ]

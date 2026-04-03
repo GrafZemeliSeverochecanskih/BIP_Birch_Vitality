@@ -80,8 +80,8 @@ def run_cv(df, config):
             pretrained = config.model.pretrained,
             freeze_backbone = config.model.freeze_backbone,
             use_dino=config.model.use_dino_segmentation,
-            dino_seg_threshold=config.model.dino_seg_threshold,
-            dino_seg_model=config.model.dino_seg_model,
+            dino_seg_threshold=config.model.dino_segmenation_threshold,
+            dino_seg_model=config.model.dino_segmentation_model,
             use_tabular=config.model.use_tabular,
             n_tabular_features=n_tab,
             tabular_hidden_dim=config.model.tabular_hidden_dim

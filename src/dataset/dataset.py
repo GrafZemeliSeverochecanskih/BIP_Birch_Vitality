@@ -203,11 +203,11 @@ def build_dataloaders(
         tabular_features = tabular_features,
         tabular_mean = tabular_mean,
         tabular_std = tabular_std,
-        image_extensions = image_extensions    
+        image_extension = image_extensions    
     )
 
-    train_dataset = BirchDataset(train_df, **shared, mode="train", augmentation=augmentation)
-    val_dataset = BirchDataset(val_df, **shared, mode="val", augmentation=augmentation)
+    train_dataset = BirchDataset(train_df, **shared, mode="train")
+    val_dataset = BirchDataset(val_df, **shared, mode="val")
     
     train_loader = DataLoader(
         train_dataset, 

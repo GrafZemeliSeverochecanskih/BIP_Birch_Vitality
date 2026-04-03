@@ -55,7 +55,7 @@ def train_epoch(
         tabular = batch["tabular"].to(device) if "tabular" in batch else None
 
         optimizer.zero_grad()
-        preds = model(images)
+        preds = model(images, tabular)
         loss = criterion(preds, targets)
         loss.backward()
         optimizer.step()
@@ -92,7 +92,7 @@ def val_epoch(
             targets = batch["vitality"].to(device)
             tabular = batch["tabular"].to(device) if "tabular" in batch else None
             
-            preds = model(images)
+            preds = model(images, tabular)
             loss = criterion(preds, targets)
             
             total_loss += loss.item()
