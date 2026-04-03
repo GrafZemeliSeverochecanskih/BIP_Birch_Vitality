@@ -114,9 +114,8 @@ class BirchDataset(Dataset):
     ):
         self.df = df.reset_index(drop=True)
         self.image_dir = image_dir
-        self.transform = get_transforms(mode, image_size)
+        self.transform = get_transforms(mode, image_size, augmentation)
         self.extensions = image_extension
-        self.image_paths = self._index_to_images()
         self.tabular_features = tabular_features
         self.tabular_mean = tabular_mean or {f: 0.0 for f in tabular_features}
         self.tabular_std = tabular_std or {f: 1.0 for f in tabular_features}
@@ -152,20 +151,22 @@ class BirchDataset(Dataset):
         
         images = torch.stack(images)
         
-        if self.tabular_features:
-            tab = []
-            for feat in self.tabular_features:
-                val =float(row[feat]) if pd.notna(row.get(feat)) else 0.0
-                mean = self.tabular_mean.get(feat, 0.0)
-                std = self.tabular_mean.get(feat, 1.0)
-                tab.append((val - mean) / (std + 1e-8))
-            item["tabular"] = torch.tensor(tab, dtype=torch.float32)
-        
-        return {
+        item = {
             "images": images,
             "vitality": vitality,
             "tree_id": int(row["ID"])
         }
+
+        if self.tabular_features:
+            tab = []
+            for feat in self.tabular_features:
+                val = float(row[feat]) if pd.notna(row.get(feat)) else 0.0
+                mean = self.tabular_mean.get(feat, 0.0)
+                std = self.tabular_std.get(feat, 1.0)
+                tab.append((val - mean) / (std + 1e-8))
+            item["tabular"] = torch.tensor(tab, dtype=torch.float32)
+        
+        return item
         
 def collate_fn(batch):
     """
@@ -226,6 +227,146 @@ def build_dataloaders(
         )
     
     return train_loader, val_loader
+
+import math
+
+def vitality_to_class(v: float) -> int:
+    """
+    Convert continuous vitality to a 0-indexed class label.
+    .5 values are rounded UP: 2.5->3, 3.5->4, 4.5->5
+    Then 0-indexed:          1->0, 2->1, 3->2, 4->3, 5->4
+    """
+    return math.ceil(v) - 1
+
+
+class BirchClassificationDataset(Dataset):
+    """
+    Same image-bag loading as BirchDataset but returns an integer class label
+    instead of a continuous vitality value.
+    """
+    def __init__(
+        self,
+        df,
+        image_dir,
+        mode="train",
+        image_size=224,
+        image_extension=(".jpg", ".jpeg", ".png"),
+        augmentation="light",
+        tabular_features=(),
+        tabular_mean=None,
+        tabular_std=None,
+    ):
+        self.df = df.reset_index(drop=True)
+        self.image_dir = image_dir
+        self.transform = get_transforms(mode, image_size, augmentation)
+        self.extensions = image_extension
+        self.tabular_features = tabular_features
+        self.tabular_mean = tabular_mean or {f: 0.0 for f in tabular_features}
+        self.tabular_std = tabular_std or {f: 1.0 for f in tabular_features}
+        self.image_paths = self._index_to_images()
+
+    def _index_to_images(self):
+        all_paths = list()
+        for tree_id in self.df["ID"]:
+            folder = self.image_dir / str(tree_id)
+            paths = sorted([
+                p for p in folder.iterdir() if p.suffix.lower() in self.extensions
+            ])
+            all_paths.append(paths)
+        return all_paths
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, index):
+        row = self.df.iloc[index]
+        paths = self.image_paths[index]
+        label = torch.tensor(vitality_to_class(float(row["vitality"])), dtype=torch.long)
+
+        images = list()
+        for p in paths:
+            try:
+                img = Image.open(p).convert("RGB")
+                img = ImageOps.exif_transpose(img)
+                img = self.transform(img)
+                images.append(img)
+            except Exception as e:
+                print(f"Error loading image {p}: {e}")
+
+        images = torch.stack(images)
+
+        item = {
+            "images": images,
+            "label": label,
+            "tree_id": int(row["ID"]),
+        }
+
+        if self.tabular_features:
+            tab = []
+            for feat in self.tabular_features:
+                val = float(row[feat]) if pd.notna(row.get(feat)) else 0.0
+                mean = self.tabular_mean.get(feat, 0.0)
+                std = self.tabular_std.get(feat, 1.0)
+                tab.append((val - mean) / (std + 1e-8))
+            item["tabular"] = torch.tensor(tab, dtype=torch.float32)
+
+        return item
+
+
+def collate_cls_fn(batch):
+    """Collate for classification: labels as long tensor."""
+    out = {
+        "images": [item["images"] for item in batch],
+        "label": torch.stack([item["label"] for item in batch]),
+        "tree_id": [item["tree_id"] for item in batch],
+    }
+    if "tabular" in batch[0]:
+        out["tabular"] = torch.stack([item["tabular"] for item in batch])
+    return out
+
+
+def build_cls_dataloaders(
+    train_df,
+    val_df,
+    image_dir,
+    batch_size=16,
+    num_workers=0,
+    image_size=224,
+    augmentation="light",
+    tabular_features=tuple(),
+    image_extensions=(".jpg", ".jpeg", ".png"),
+    tabular_mean=None,
+    tabular_std=None,
+):
+    shared = dict(
+        image_dir=image_dir,
+        image_size=image_size,
+        augmentation=augmentation,
+        tabular_features=tabular_features,
+        tabular_mean=tabular_mean,
+        tabular_std=tabular_std,
+        image_extension=image_extensions,
+    )
+
+    train_dataset = BirchClassificationDataset(train_df, **shared, mode="train")
+    val_dataset = BirchClassificationDataset(val_df, **shared, mode="val")
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        collate_fn=collate_cls_fn,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=collate_cls_fn,
+        num_workers=num_workers,
+    )
+    return train_loader, val_loader
+
 
 if __name__ == "__main__":
     

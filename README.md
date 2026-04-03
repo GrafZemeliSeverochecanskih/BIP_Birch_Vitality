@@ -71,16 +71,16 @@ bip/
 ## Model Architecture
 
 ```
-Photos (N × 3 × 224 × 224)
+Photos (N * 3 * 224 * 224)
         │
         ▼
   CNN/ViT Backbone          ← pretrained on ImageNet via timm
-        │  (N × feature_dim)
+        │  (N * feature_dim)
         ▼
     Aggregator              ← mean / max / attention
         │  (feature_dim,)
         ▼
-  Regression Head           ← Linear → ReLU → Dropout → Linear
+  Regression Head           ← Linear -> ReLU -> Dropout -> Linear
         │  (scalar)
         ▼
   Vitality score  (1–5)

@@ -8,17 +8,52 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 from config.config import Config
 
 def get_backbone(name, pretrained=True):
-    backbone = timm.create_model(
-        name,
-        pretrained=pretrained,
-        num_classes=0,  # Remove the classification head
-        global_pool="avg"  # Use global average pooling
-    )
-    
+    is_dino = ".dino" in name
+
+    if is_dino and pretrained:
+        # DINO-pretrained ViTs ship with "norm.weight/bias" but newer timm
+        # architectures expect "fc_norm.weight/bias".  We load the weights
+        # manually with key remapping to avoid the strict-loading error.
+        backbone = timm.create_model(
+            name,
+            pretrained=False,       # don't auto-load yet
+            num_classes=0,
+            global_pool="avg",
+        )
+        # Download the official pretrained state dict
+        pretrained_cfg = backbone.pretrained_cfg
+        state_dict = timm.models.load_state_dict_from_hf(
+            pretrained_cfg["hf_hub_id"],
+        ) if "hf_hub_id" in pretrained_cfg else timm.models.load_state_dict_from_url(
+            pretrained_cfg["url"],
+        )
+        # Remap norm -> fc_norm if the model expects fc_norm
+        remapped = {}
+        for k, v in state_dict.items():
+            new_key = k
+            if k == "norm.weight":
+                new_key = "fc_norm.weight"
+            elif k == "norm.bias":
+                new_key = "fc_norm.bias"
+            remapped[new_key] = v
+        # Drop head keys that don't exist (num_classes=0 removes the head)
+        missing, unexpected = backbone.load_state_dict(remapped, strict=False)
+        if missing:
+            print(f"  [DINO load] missing keys (ok if head-related): {missing}")
+        if unexpected:
+            print(f"  [DINO load] unexpected keys (ok if head-related): {unexpected}")
+    else:
+        backbone = timm.create_model(
+            name,
+            pretrained=pretrained,
+            num_classes=0,
+            global_pool="avg",
+        )
+
     with torch.no_grad():
         dummy = torch.zeros(1, 3, 224, 224)
         feature_dim = backbone(dummy).shape[-1]
-    
+
     print(f"Backbone: {name}")
     print(f"Feature dim: {feature_dim}")
     return backbone, feature_dim
@@ -119,9 +154,10 @@ class DINOSegmenter(nn.Module):
         
         self.vit(images)
         
-        attn = self._attn
-        cls_attn = attn[:, :, 0, -1]
-        cls_attn = cls_attn.reshape(B, h_p, w_p)
+        attn = self._attn                        # (B, num_heads, num_tokens, num_tokens)
+        cls_attn = attn[:, :, 0, 1:]                # (B, num_heads, num_patches) — CLS → all patches
+        cls_attn = cls_attn.mean(dim=1)             # (B, num_patches) — average over heads
+        cls_attn = cls_attn.reshape(B, h_p, w_p)    # (B, h_p, w_p)
         
         a_min = cls_attn.flatten(1).min(dim=1)[0].view(B, 1, 1)
         a_max = cls_attn.flatten(1).max(dim=1)[0].view(B, 1, 1)
@@ -284,6 +320,136 @@ def build_model(cfg: Config, n_tabular_features: int):
         n_tabular_features = n_tabular_features,
         tabular_hidden_dim = cfg.model.get("tabular_hidden_dim", 64)
     )
+
+class ClassificationHead(nn.Module):
+    def __init__(self, feature_dim, num_classes, hidden_dim=256, dropout=0.3):
+        super().__init__()
+        self.head = nn.Sequential(
+            nn.Linear(feature_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, num_classes)
+        )
+
+    def forward(self, x: torch.Tensor):
+        return self.head(x)  # (num_classes,) — raw logits
+
+
+class BirchVitalityClassifier(nn.Module):
+    """
+    MIL classification model for birch tree vitality.
+
+    Identical architecture to BirchVitalityModel (backbone -> aggregator -> head)
+    but outputs class logits instead of a scalar regression value.
+
+    Args:
+        num_classes:     number of vitality classes (default 5: classes 1–5)
+        backbone_name:   timm model name
+        aggregator_name: "mean", "max", or "attention"
+        hidden_dim:      classification head hidden size
+        dropout:         dropout rate
+        pretrained:      use ImageNet pretrained weights
+        freeze_backbone: freeze backbone weights
+        use_dino:        enable DINO attention-based segmentation
+        use_tabular:     enable tabular feature fusion
+    """
+    def __init__(
+        self,
+        num_classes=5,
+        backbone_name="efficientnet_b0",
+        aggregator_name="attention",
+        hidden_dim=256,
+        dropout=0.3,
+        pretrained=True,
+        freeze_backbone=False,
+
+        use_dino=False,
+        dino_seg_model: str = "vit_small_patch16_224.dino",
+        dino_seg_threshold: float = 0.6,
+
+        use_tabular: bool = False,
+        n_tabular_features: int = 0,
+        tabular_hidden_dim: int = 64,
+    ):
+        super().__init__()
+        self.num_classes = num_classes
+
+        self.segmenter = (
+            DINOSegmenter(dino_seg_model, dino_seg_threshold) if use_dino else None
+        )
+
+        self.backbone, feature_dim = get_backbone(backbone_name, pretrained)
+        self.aggregator = get_aggregator(aggregator_name, feature_dim)
+
+        if freeze_backbone:
+            for param in self.backbone.parameters():
+                param.requires_grad = False
+            print("Backbone frozen. Only aggregator and classification head will be trained.")
+
+        tabular_out_dim = 0
+        self.tabular_encoder = None
+        if use_tabular and n_tabular_features > 0:
+            tabular_out_dim = tabular_hidden_dim
+            self.tabular_encoder = TabularEncoder(
+                n_tabular_features, tabular_hidden_dim, tabular_out_dim
+            )
+
+        self.classification_head = ClassificationHead(
+            feature_dim + tabular_out_dim, num_classes, hidden_dim, dropout
+        )
+
+    def forward_single(self, images, tabular):
+        if self.segmenter is not None:
+            images = self.segmenter(images)
+
+        features = self.backbone(images.to(next(self.parameters()).device))
+        aggregated = self.aggregator(features)
+
+        if self.tabular_encoder is not None and tabular is not None:
+            tab_emb = self.tabular_encoder(tabular)
+            aggregated = torch.cat([aggregated, tab_emb], dim=-1)
+
+        logits = self.classification_head(aggregated)  # (num_classes,)
+        return logits
+
+    def forward(self, images, tabular):
+        if tabular is not None:
+            logits = [
+                self.forward_single(imgs, tab)
+                for imgs, tab in zip(images, tabular)
+            ]
+        else:
+            logits = [self.forward_single(imgs, None) for imgs in images]
+        return torch.stack(logits)  # (B, num_classes)
+
+    def unfreeze_backbone(self):
+        for param in self.backbone.parameters():
+            param.requires_grad = True
+        print("Backbone unfrozen. All parameters will be trained.")
+
+    def count_parameters(self):
+        total = sum(p.numel() for p in self.parameters())
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        return {"total": total, "trainable": trainable, "frozen": total - trainable}
+
+
+def build_classifier(cfg: Config, n_tabular_features: int, num_classes: int = 5):
+    return BirchVitalityClassifier(
+        num_classes=num_classes,
+        backbone_name=cfg.model.get("backbone", "efficientnet_b0"),
+        aggregator_name=cfg.model.get("aggregator", "attention"),
+        hidden_dim=cfg.model.get("hidden_dim", 256),
+        dropout=cfg.model.get("dropout", 0.3),
+        pretrained=cfg.model.get("pretrained", True),
+        freeze_backbone=cfg.model.get("freeze_backbone", False),
+        use_dino_seg=cfg.model.get("use_dino_seg", False),
+        dino_seg_model=cfg.model.get("dino_segmentation_model", "vit_small_patch16_224.dino"),
+        dino_seg_threshold=cfg.model.get("dino_segmenation_threshold", 0.6),
+        use_tabular=cfg.model.get("use_tabular", False),
+        n_tabular_features=n_tabular_features,
+        tabular_hidden_dim=cfg.model.get("tabular_hidden_dim", 64),
+    )
+
 
 if __name__ == "__main__":
     print("model sanity check:")
