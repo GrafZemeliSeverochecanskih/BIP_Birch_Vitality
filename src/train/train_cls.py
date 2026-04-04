@@ -203,7 +203,7 @@ def train_cls_fold(
             f"({elapsed:.1f} s)"
         )
 
-        stop = early_stopping.step(val_m["loss"], model, epoch)
+        stop = early_stopping.step(val_m["loss"], model, epoch, acc=val_m["accuracy"], f1=val_m["f1"])
         if stop:
             print(
                 f"Early stopping at epoch {epoch} "
@@ -218,11 +218,19 @@ def train_cls_fold(
         model.load_state_dict(torch.load(checkpoint_path, weights_only=True))
         print(f"Loaded best weights from {checkpoint_path}")
 
-    best_epoch = early_stopping.best_epoch
+    # If no epochs ran this session (fully resumed), compute metrics from the loaded model
+    if not history["val_acc"]:
+        val_m = val_cls_epoch(model, val_loader, criterion, device, num_classes)
+        best_acc = val_m["accuracy"]
+        best_f1 = val_m["f1"]
+    else:
+        best_acc = early_stopping.best_metrics.get("acc", 0.0)
+        best_f1 = early_stopping.best_metrics.get("f1", 0.0)
+
     return {
         "best_val_loss": early_stopping.best_loss,
-        "best_val_acc": history["val_acc"][best_epoch - 1],
-        "best_val_f1": history["val_f1"][best_epoch - 1],
-        "best_epoch": best_epoch,
+        "best_val_acc": best_acc,
+        "best_val_f1": best_f1,
+        "best_epoch": early_stopping.best_epoch,
         "history": history,
     }

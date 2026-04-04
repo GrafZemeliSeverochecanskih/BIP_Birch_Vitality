@@ -34,7 +34,7 @@ def evaluate_test(config=None):
     
     import json 
     tabular_features, tabular_mean, tabular_std = (), {}, {}
-    if config.model.use:
+    if config.model.use_tabular:
         stats_path = config.paths.output_dir / "tabular_stats.json"
         with open(stats_path) as f:
             tab_stats = json.load(f)
@@ -88,7 +88,7 @@ def evaluate_test(config=None):
         for batch in test_loader:
             images = [img.to(device) for img in batch["images"]]
             targets = batch["vitality"].to(device)
-            preds = model(images)
+            preds = model(images, None)
             all_preds.append(preds.cpu())
             all_targets.append(targets.cpu())
             all_ids.extend(batch["tree_id"])

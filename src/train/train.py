@@ -114,16 +114,14 @@ class EarlyStopping:
         self.patience = patience
         self.checkpoint_path = checkpoint_path
         self.best_loss = float("inf")
-        self.best_mae = float("inf")
-        self.best_r2 = float("-inf")
+        self.best_metrics = {}
         self.counter = 0
         self.best_epoch = 0
 
-    def step(self, val_loss, val_mae, val_r2, model, epoch):
+    def step(self, val_loss, model, epoch, **metrics):
         if val_loss < self.best_loss:
             self.best_loss = val_loss
-            self.best_mae = val_mae
-            self.best_r2 = val_r2
+            self.best_metrics = dict(metrics)
             self.counter = 0
             self.best_epoch = epoch
             if self.checkpoint_path is not None:
@@ -215,7 +213,7 @@ def train_fold(
             f"({elapsed:.1f} s)"
         )
         
-        stop = early_stopping.step(val_metrics["loss"], val_metrics["mae"], val_metrics["r2"], model, epoch)
+        stop = early_stopping.step(val_metrics["loss"], model, epoch, mae=val_metrics["mae"], r2=val_metrics["r2"])
         if stop:
             print(f"Early stopping at epoch {epoch}"
                   f"(best epoch: {early_stopping.best_epoch})"
@@ -235,8 +233,8 @@ def train_fold(
         best_mae = val_metrics["mae"]
         best_r2 = val_metrics["r2"]
     else:
-        best_mae = early_stopping.best_mae
-        best_r2 = early_stopping.best_r2
+        best_mae = early_stopping.best_metrics.get("mae", float("inf"))
+        best_r2 = early_stopping.best_metrics.get("r2", float("-inf"))
 
     return {
         "best_val_loss": early_stopping.best_loss,
