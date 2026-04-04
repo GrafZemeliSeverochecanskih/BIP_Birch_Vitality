@@ -114,19 +114,23 @@ class EarlyStopping:
         self.patience = patience
         self.checkpoint_path = checkpoint_path
         self.best_loss = float("inf")
+        self.best_mae = float("inf")
+        self.best_r2 = float("-inf")
         self.counter = 0
         self.best_epoch = 0
-    
-    def step(self, val_loss, model, epoch):
+
+    def step(self, val_loss, val_mae, val_r2, model, epoch):
         if val_loss < self.best_loss:
             self.best_loss = val_loss
+            self.best_mae = val_mae
+            self.best_r2 = val_r2
             self.counter = 0
             self.best_epoch = epoch
             if self.checkpoint_path is not None:
                 torch.save(model.state_dict(), self.checkpoint_path)
         else:
             self.counter += 1
-            
+
         return self.counter >= self.patience
 
 def train_fold(
@@ -211,7 +215,7 @@ def train_fold(
             f"({elapsed:.1f} s)"
         )
         
-        stop = early_stopping.step(val_metrics["loss"], model, epoch)
+        stop = early_stopping.step(val_metrics["loss"], val_metrics["mae"], val_metrics["r2"], model, epoch)
         if stop:
             print(f"Early stopping at epoch {epoch}"
                   f"(best epoch: {early_stopping.best_epoch})"
@@ -224,13 +228,21 @@ def train_fold(
     if checkpoint_path.exists():
         model.load_state_dict(torch.load(checkpoint_path, weights_only=True))
         print(f"Loaded best weights from {checkpoint_path}")
-        
-    best_epoch = early_stopping.best_epoch
+
+    # If no epochs ran this session (fully resumed), compute metrics from the loaded model
+    if not history["val_mae"]:
+        val_metrics = val_epoch(model, val_loader, criterion, device)
+        best_mae = val_metrics["mae"]
+        best_r2 = val_metrics["r2"]
+    else:
+        best_mae = early_stopping.best_mae
+        best_r2 = early_stopping.best_r2
+
     return {
         "best_val_loss": early_stopping.best_loss,
-        "best_val_mae": history["val_mae"][best_epoch - 1],
-        "best_val_r2": history["val_r2"][best_epoch - 1],
-        "best_epoch": best_epoch,
+        "best_val_mae": best_mae,
+        "best_val_r2": best_r2,
+        "best_epoch": early_stopping.best_epoch,
         "history": history
     }
     
