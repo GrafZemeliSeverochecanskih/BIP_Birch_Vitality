@@ -1,7 +1,3 @@
-"""
-Classification cross-validation runner — mirrors evaluate.py
-but builds BirchVitalityClassifier and uses classification metrics.
-"""
 from pathlib import Path
 
 import numpy as np
@@ -203,5 +199,5 @@ def _print_cls_summary(results_df, config):
     )
     print("=" * 60)
     print(f"Final: Acc = {summary['mean_val_acc']:.4f} ± {summary['std_val_acc']:.4f}")
-    print(f"       F1  = {summary['mean_val_f1']:.4f} ± {summary['std_val_f1']:.4f}")
+    print(f"F1 = {summary['mean_val_f1']:.4f} ± {summary['std_val_f1']:.4f}")
     return summary

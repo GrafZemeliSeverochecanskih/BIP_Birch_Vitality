@@ -60,7 +60,7 @@ def build_cls_ablation_config(ablation: dict) -> ClassificationConfig:
         dino_segmentation_model="vit_small_patch16_224.dino",
         dino_segmenation_threshold=0.6,
         use_tabular=use_tab,
-        tabular_features=("circumference_cm",) if use_tab else (),
+        tabular_features=("N", "E", "circumference_cm", "fungal_infection") if use_tab else (),
         tabular_hidden_dim=64,
     )
 

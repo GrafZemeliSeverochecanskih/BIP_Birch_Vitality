@@ -15,7 +15,7 @@ class ModelConfig:
     dino_segmenation_threshold: float = 0.6
     
     use_tabular: bool = False
-    tabular_features: tuple = ("circumference_cm", )
+    tabular_features: tuple = ("N", "E", "circumference_cm", "fungal_infection")
     tabular_hidden_dim: int = 64
     
 @dataclass
@@ -167,7 +167,7 @@ class WithTabular(Config):
             backbone="vit_small_patch16_224",
             aggregator="attention",
             use_tabular=True,
-            tabular_features=("circumference_cm",),
+            tabular_features=("N", "E", "circumference_cm", "fungal_infection"),
             tabular_hidden_dim=64
         )
         self.training = TrainConfig()
@@ -182,7 +182,7 @@ class DINOWithTabular(Config):
             aggregator="attention",
             use_dino_segmentation=True,
             use_tabular=True,
-            tabular_features=("circumference_cm", "fungal_infection"),
+            tabular_features=("N", "E", "circumference_cm", "fungal_infection"),
             tabular_hidden_dim=64
         )
         self.training = TrainConfig()
