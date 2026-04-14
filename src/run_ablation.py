@@ -5,12 +5,16 @@ from datetime import datetime
 
 import pandas as pd
 import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
 
 sys.path.append(str(Path(__file__).parent))
 
 from config.config import Config, ModelConfig, TrainConfig, DataConfig, PathConfig
-from dataset.dataset import filter_trees_with_images
+from dataset.dataset import BirchDataset, collate_fn, compute_tabular_stats, filter_trees_with_images
 from evaluate.evaluate import run_cv, make_vitality_bins
+from model.model import BirchVitalityModel
+from train.train import train_epoch, val_epoch
 from sklearn.model_selection import train_test_split
 
 COLUMN_NAME = {
@@ -72,6 +76,73 @@ def build_ablation_config(ablation: dict) -> Config:
     return cfg
 
 
+def _train_and_eval_test(df_train_val, df_test, cfg, fold_results, device):
+    """Train a final model on all train_val data and evaluate on the held-out test set."""
+    tabular_mean, tabular_std = {}, {}
+    if cfg.model.use_tabular and cfg.model.tabular_features:
+        tabular_mean, tabular_std = compute_tabular_stats(df_train_val, cfg.model.tabular_features)
+
+    shared = dict(
+        image_dir=cfg.paths.image_dir,
+        image_size=cfg.data.image_size,
+        tabular_features=cfg.model.tabular_features,
+        tabular_mean=tabular_mean,
+        tabular_std=tabular_std,
+        image_extension=cfg.data.image_extensions,
+    )
+    train_loader = DataLoader(
+        BirchDataset(df_train_val, **shared, mode="train"),
+        batch_size=cfg.training.batch_size,
+        shuffle=True,
+        collate_fn=collate_fn,
+        num_workers=cfg.data.num_workers,
+    )
+    test_loader = DataLoader(
+        BirchDataset(df_test, **shared, mode="val"),
+        batch_size=cfg.training.batch_size,
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=cfg.data.num_workers,
+    )
+
+    mean_best_epoch = int(round(sum(fr["best_epoch"] for fr in fold_results) / len(fold_results)))
+    print(f"  Final model: training for {mean_best_epoch} epochs on all {len(df_train_val)} train_val trees...")
+
+    n_tab = len(cfg.model.tabular_features) if cfg.model.use_tabular else 0
+    model = BirchVitalityModel(
+        backbone_name=cfg.model.backbone,
+        aggregator_name=cfg.model.aggregator,
+        hidden_dim=cfg.model.hidden_dim,
+        dropout=cfg.model.dropout,
+        pretrained=cfg.model.pretrained,
+        freeze_backbone=cfg.model.freeze_backbone,
+        use_dino=cfg.model.use_dino_segmentation,
+        dino_seg_threshold=cfg.model.dino_segmenation_threshold,
+        dino_seg_model=cfg.model.dino_segmentation_model,
+        use_tabular=cfg.model.use_tabular,
+        n_tabular_features=n_tab,
+        tabular_hidden_dim=cfg.model.tabular_hidden_dim,
+    ).to(device)
+
+    optimizer = torch.optim.Adam(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=cfg.training.lr,
+        weight_decay=cfg.training.weight_decay,
+    )
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=5)
+    criterion = nn.MSELoss()
+
+    for epoch in range(1, mean_best_epoch + 1):
+        m = train_epoch(model, train_loader, optimizer, criterion, device)
+        scheduler.step(m["loss"])
+        if epoch % 10 == 0 or epoch == mean_best_epoch:
+            print(f"    Epoch {epoch}/{mean_best_epoch} | loss={m['loss']:.4f} | MAE={m['mae']:.4f}")
+
+    test_m = val_epoch(model, test_loader, criterion, device)
+    print(f"  Test MAE={test_m['mae']:.4f} | Test R²={test_m['r2']:.4f}")
+    return test_m
+
+
 def run_ablation():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -130,8 +201,13 @@ def run_ablation():
                 "val_mae": round(fr["best_val_mae"], 4),
                 "val_r2": round(fr["best_val_r2"], 4),
                 "best_epoch": fr["best_epoch"],
+                "test_mae": "",
+                "test_r2": "",
                 "type": "fold",
             })
+
+        print(f"\nEvaluating {name} on held-out test set ({len(df_test)} trees)...")
+        test_m = _train_and_eval_test(df_train_val, df_test, cfg, results["fold_results"], device)
 
         all_rows.append({
             "experiment": name,
@@ -142,12 +218,15 @@ def run_ablation():
             "val_mae": f"{summary['mean_val_mae']:.4f}±{summary['std_val_mae']:.4f}",
             "val_r2": f"{summary['mean_val_r2']:.4f}±{summary['std_val_r2']:.4f}",
             "best_epoch": "",
+            "test_mae": round(test_m["mae"], 4),
+            "test_r2": round(test_m["r2"], 4),
             "type": "summary",
         })
 
         print(f"\n {name} completed in {elapsed/60:.1f} min")
-        print(f"MAE = {summary['mean_val_mae']:.4f} ± {summary['std_val_mae']:.4f}")
-        print(f"R^2 = {summary['mean_val_r2']:.4f} ± {summary['std_val_r2']:.4f}")
+        print(f"CV  MAE = {summary['mean_val_mae']:.4f} ± {summary['std_val_mae']:.4f}")
+        print(f"CV  R^2 = {summary['mean_val_r2']:.4f} ± {summary['std_val_r2']:.4f}")
+        print(f"Test MAE = {test_m['mae']:.4f} | Test R^2 = {test_m['r2']:.4f}")
 
     results_df = pd.DataFrame(all_rows)
     output_path = Path("outputs") / "ablation_results.csv"
@@ -160,7 +239,7 @@ def run_ablation():
     print(f"Results saved to {output_path.resolve()}")
 
     summary_df = results_df[results_df["type"] == "summary"][
-        ["experiment", "use_dino", "use_tabular", "val_mae", "val_r2"]
+        ["experiment", "use_dino", "use_tabular", "val_mae", "val_r2", "test_mae", "test_r2"]
     ]
     print("\n" + summary_df.to_string(index=False))
     print("=" * 60)
