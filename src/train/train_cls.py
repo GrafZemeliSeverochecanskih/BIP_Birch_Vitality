@@ -9,6 +9,7 @@ from collections import Counter
 import torch
 import torch.nn as nn
 import numpy as np
+from torch.amp import autocast, GradScaler
 
 import sys
 from pathlib import Path
@@ -59,22 +60,30 @@ def compute_class_weights(labels, num_classes: int) -> torch.Tensor:
 
 # ── Epoch loops ──────────────────────────────────────────────────────
 
-def train_cls_epoch(model, loader, optimizer, criterion, device, num_classes):
+def train_cls_epoch(model, loader, optimizer, criterion, device, num_classes, scaler=None):
     model.train()
     all_preds, all_targets = [], []
     total_loss = 0.0
     n_batches = 0
 
+    use_amp = scaler is not None
     for batch in loader:
         images = [img.to(device) for img in batch["images"]]
         targets = batch["label"].to(device)
         tabular = batch["tabular"].to(device) if "tabular" in batch else None
 
         optimizer.zero_grad()
-        logits = model(images, tabular)  # (B, C)
-        loss = criterion(logits, targets)
-        loss.backward()
-        optimizer.step()
+        with autocast(device_type=device.type, enabled=use_amp):
+            logits = model(images, tabular)  # (B, C)
+            loss = criterion(logits, targets)
+
+        if use_amp:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
 
         total_loss += loss.item()
         all_preds.append(logits.detach().cpu())
@@ -149,6 +158,11 @@ def train_cls_fold(
     else:
         criterion = nn.CrossEntropyLoss()
 
+    use_amp = getattr(config.training, "use_amp", False) and device.type == "cuda"
+    scaler = GradScaler(device="cuda") if use_amp else None
+    if use_amp:
+        print("AMP (mixed precision) enabled.")
+
     checkpoint_path = config.paths.checkpoint_dir / f"fold_{fold}_best.pt"
     early_stopping = EarlyStopping(
         patience=config.training.patience,
@@ -169,17 +183,18 @@ def train_cls_fold(
 
     start_epoch = 1
     resume_path = config.paths.checkpoint_dir / f"fold_{fold}_resume.pt"
+    should_resume = getattr(config.training, "resume", True)
 
-    if resume_path.exists():
+    if should_resume and resume_path.exists():
         print(f"Resume fold {fold} from {resume_path}")
-        start_epoch, best_loss = load_checkpoint(resume_path, model, optimizer, scheduler)
+        start_epoch, best_loss = load_checkpoint(resume_path, model, optimizer, scheduler, scaler)
         early_stopping.best_loss = best_loss
         start_epoch += 1
-        print(f"Resume from epoch {start_epoch - 1}")
+        print(f"Resumed from epoch {start_epoch - 1}")
 
     for epoch in range(start_epoch, config.training.epochs + 1):
         t0 = time.time()
-        train_m = train_cls_epoch(model, train_loader, optimizer, criterion, device, num_classes)
+        train_m = train_cls_epoch(model, train_loader, optimizer, criterion, device, num_classes, scaler=scaler)
         val_m = val_cls_epoch(model, val_loader, criterion, device, num_classes)
         scheduler.step(val_m["loss"])
 
@@ -212,7 +227,7 @@ def train_cls_fold(
             )
             break
 
-        save_checkpoint(resume_path, model, optimizer, scheduler, epoch, early_stopping.best_loss)
+        save_checkpoint(resume_path, model, optimizer, scheduler, epoch, early_stopping.best_loss, scaler=scaler)
 
     if checkpoint_path.exists():
         model.load_state_dict(torch.load(checkpoint_path, weights_only=True))

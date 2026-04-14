@@ -110,7 +110,8 @@ class BirchDataset(Dataset):
         augmentation="light",
         tabular_features= (),
         tabular_mean = None,
-        tabular_std = None
+        tabular_std = None,
+        n_copies: int = 1,
     ):
         self.df = df.reset_index(drop=True)
         self.image_dir = image_dir
@@ -119,6 +120,9 @@ class BirchDataset(Dataset):
         self.tabular_features = tabular_features
         self.tabular_mean = tabular_mean or {f: 0.0 for f in tabular_features}
         self.tabular_std = tabular_std or {f: 1.0 for f in tabular_features}
+        # n_copies > 1: each tree appears N times per epoch, each time with a
+        # fresh random augmentation.  Only applied in train mode (val ignores it).
+        self.n_copies = n_copies if mode == "train" else 1
         self.image_paths = self._index_to_images()
     
     def _index_to_images(self):
@@ -132,11 +136,12 @@ class BirchDataset(Dataset):
         return all_paths
 
     def __len__(self):
-        return len(self.df)
-    
+        return len(self.df) * self.n_copies
+
     def __getitem__(self, index):
-        row = self.df.iloc[index]
-        paths = self.image_paths[index]
+        real_index = index % len(self.df)
+        row = self.df.iloc[real_index]
+        paths = self.image_paths[real_index]
         vitality = torch.tensor(float(row["vitality"]), dtype=torch.float32)
         
         images = list()
@@ -196,6 +201,7 @@ def build_dataloaders(
     image_extensions = (".jpg", ".jpeg", ".png"),
     tabular_mean = None,
     tabular_std = None,
+    n_copies: int = 1,
 ):
     shared = dict(
         image_dir = image_dir,
@@ -204,10 +210,10 @@ def build_dataloaders(
         tabular_features = tabular_features,
         tabular_mean = tabular_mean,
         tabular_std = tabular_std,
-        image_extension = image_extensions    
+        image_extension = image_extensions,
     )
 
-    train_dataset = BirchDataset(train_df, **shared, mode="train")
+    train_dataset = BirchDataset(train_df, **shared, mode="train", n_copies=n_copies)
     val_dataset = BirchDataset(val_df, **shared, mode="val")
     
     train_loader = DataLoader(
@@ -255,6 +261,7 @@ class BirchClassificationDataset(Dataset):
         tabular_features=(),
         tabular_mean=None,
         tabular_std=None,
+        n_copies: int = 1,
     ):
         self.df = df.reset_index(drop=True)
         self.image_dir = image_dir
@@ -263,6 +270,7 @@ class BirchClassificationDataset(Dataset):
         self.tabular_features = tabular_features
         self.tabular_mean = tabular_mean or {f: 0.0 for f in tabular_features}
         self.tabular_std = tabular_std or {f: 1.0 for f in tabular_features}
+        self.n_copies = n_copies if mode == "train" else 1
         self.image_paths = self._index_to_images()
 
     def _index_to_images(self):
@@ -276,11 +284,12 @@ class BirchClassificationDataset(Dataset):
         return all_paths
 
     def __len__(self):
-        return len(self.df)
+        return len(self.df) * self.n_copies
 
     def __getitem__(self, index):
-        row = self.df.iloc[index]
-        paths = self.image_paths[index]
+        real_index = index % len(self.df)
+        row = self.df.iloc[real_index]
+        paths = self.image_paths[real_index]
         label = torch.tensor(vitality_to_class(float(row["vitality"])), dtype=torch.long)
 
         images = list()
@@ -337,6 +346,7 @@ def build_cls_dataloaders(
     image_extensions=(".jpg", ".jpeg", ".png"),
     tabular_mean=None,
     tabular_std=None,
+    n_copies: int = 1,
 ):
     shared = dict(
         image_dir=image_dir,
@@ -348,7 +358,7 @@ def build_cls_dataloaders(
         image_extension=image_extensions,
     )
 
-    train_dataset = BirchClassificationDataset(train_df, **shared, mode="train")
+    train_dataset = BirchClassificationDataset(train_df, **shared, mode="train", n_copies=n_copies)
     val_dataset = BirchClassificationDataset(val_df, **shared, mode="val")
 
     train_loader = DataLoader(

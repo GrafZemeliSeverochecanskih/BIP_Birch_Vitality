@@ -4,6 +4,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import numpy as np
+from torch.amp import autocast, GradScaler
 
 import sys
 from pathlib import Path
@@ -20,20 +21,25 @@ def r2_score(preds, targets):
         return 0.0
     return (1 - ss_res/ss_tot).item()
 
-def save_checkpoint(path, model, optimizer, scheduler, epoch, best_loss):
-    torch.save({
-        "epoch":epoch,
+def save_checkpoint(path, model, optimizer, scheduler, epoch, best_loss, scaler=None):
+    d = {
+        "epoch": epoch,
         "model_state": model.state_dict(),
         "optimizer_state": optimizer.state_dict(),
         "scheduler_state": scheduler.state_dict(),
         "best_loss": best_loss,
-    }, path)
+    }
+    if scaler is not None:
+        d["scaler_state"] = scaler.state_dict()
+    torch.save(d, path)
 
-def load_checkpoint(path, model, optimizer, scheduler):
+def load_checkpoint(path, model, optimizer, scheduler, scaler=None):
     checkpoint = torch.load(path, weights_only=False)
     model.load_state_dict(checkpoint["model_state"])
     optimizer.load_state_dict(checkpoint["optimizer_state"])
     scheduler.load_state_dict(checkpoint["scheduler_state"])
+    if scaler is not None and "scaler_state" in checkpoint:
+        scaler.load_state_dict(checkpoint["scaler_state"])
     return checkpoint["epoch"], checkpoint["best_loss"]
 
 def train_epoch(
@@ -41,7 +47,8 @@ def train_epoch(
     loader,
     optimizer,
     criterion,
-    device  
+    device,
+    scaler=None,
 ):
     model.train()
     all_preds = list()
@@ -49,25 +56,33 @@ def train_epoch(
     total_loss = 0.0
     n_batches = 0
 
+    use_amp = scaler is not None
     for batch in loader:
         images = [img.to(device) for img in batch["images"]]
         targets = batch["vitality"].to(device)
         tabular = batch["tabular"].to(device) if "tabular" in batch else None
 
         optimizer.zero_grad()
-        preds = model(images, tabular)
-        loss = criterion(preds, targets)
-        loss.backward()
-        optimizer.step()
-        
+        with autocast(device_type=device.type, enabled=use_amp):
+            preds = model(images, tabular)
+            loss = criterion(preds, targets)
+
+        if use_amp:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
+
         total_loss += loss.item()
         all_preds.append(preds.detach().cpu())
         all_targets.append(targets.detach().cpu())
         n_batches += 1
-    
+
     all_preds = torch.cat(all_preds)
     all_targets = torch.cat(all_targets)
-    
+
     return {
         "loss": total_loss / n_batches,
         "mae": mean_absolute_error(all_preds, all_targets),
@@ -154,7 +169,12 @@ def train_fold(
     )
     
     criterion = nn.MSELoss()
-    
+
+    use_amp = getattr(config.training, "use_amp", False) and device.type == "cuda"
+    scaler = GradScaler(device="cuda") if use_amp else None
+    if use_amp:
+        print("AMP (mixed precision) enabled.")
+
     checkpoint_path = config.paths.checkpoint_dir / f"fold_{fold}_best.pt"
     early_stopping = EarlyStopping(
         patience=config.training.patience,
@@ -179,17 +199,18 @@ def train_fold(
     
     start_epoch = 1
     resume_path = config.paths.checkpoint_dir / f"fold_{fold}_resume.pt"
+    should_resume = getattr(config.training, "resume", True)
 
-    if resume_path.exists():
+    if should_resume and resume_path.exists():
         print(f"Resume fold {fold} from {resume_path}")
-        start_epoch, best_loss = load_checkpoint(resume_path, model, optimizer, scheduler)
+        start_epoch, best_loss = load_checkpoint(resume_path, model, optimizer, scheduler, scaler)
         early_stopping.best_loss = best_loss
         start_epoch += 1
-        print(f"Resume from epoch {start_epoch - 1}")
+        print(f"Resumed from epoch {start_epoch - 1}")
 
     for epoch in range(start_epoch, config.training.epochs + 1):
         t0 = time.time()
-        train_metrics = train_epoch(model, train_loader, optimizer, criterion, device)
+        train_metrics = train_epoch(model, train_loader, optimizer, criterion, device, scaler=scaler)
         val_metrics = val_epoch(model, val_loader, criterion, device)
         scheduler.step(val_metrics["loss"])
         
@@ -221,7 +242,7 @@ def train_fold(
                   )
             break
         
-        save_checkpoint(resume_path, model, optimizer, scheduler, epoch, early_stopping.best_loss)
+        save_checkpoint(resume_path, model, optimizer, scheduler, epoch, early_stopping.best_loss, scaler=scaler)
 
     if checkpoint_path.exists():
         model.load_state_dict(torch.load(checkpoint_path, weights_only=True))

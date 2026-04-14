@@ -27,8 +27,9 @@ class TrainConfig:
     patience: int = 10
     cv_folds: int = 3
     resume: bool = True
-    
-    
+    use_amp: bool = True          # mixed precision (fp16) — free speedup on A100
+
+
 @dataclass
 class DataConfig:
     image_size: int = 224
@@ -36,7 +37,8 @@ class DataConfig:
     image_extensions: tuple = (".jpg", ".jpeg", ".png")
     csv_encoding: str = "cp1250"
     csv_sep: str = ";"
-    augmentation: str = "light" 
+    augmentation: str = "light"
+    augmentation_copies: int = 1  # >1 repeats each tree N times per epoch with fresh augmentation
 
 @dataclass
 class PathConfig:
@@ -104,7 +106,10 @@ class Config:
         print(f"weight_decay: {self.training.weight_decay}")
         print(f"patience: {self.training.patience}")
         print(f"cv_folds: {self.training.cv_folds}")
+        print(f"use_amp: {self.training.use_amp}")
         print("="*40)
+        print(f"augmentation: {self.data.augmentation}")
+        print(f"augmentation_copies: {self.data.augmentation_copies}")
         print(f"image_size: {self.data.image_size}")
         print(f"image_dir: {self.paths.image_dir}")
         print(f"csv_path: {self.paths.csv_path}")
@@ -189,6 +194,72 @@ class DINOWithTabular(Config):
         self.data = DataConfig()
         self.paths = PathConfig()
         super().__post_init__()
+
+# ── Advanced model presets ─────────────────────────────────────────────────────
+# These use larger backbones and stronger augmentation to push performance further.
+# Checkpoint dirs are distinct so they never overwrite the original ablation runs.
+
+class ViTBaseDINOTabular(Config):
+    """vit_base (768-dim, 4× params vs small) + DINO seg + tabular.
+    Drop-in upgrade of the best ablation winner."""
+    def __post_init__(self):
+        self.model = ModelConfig(
+            backbone="vit_base_patch16_224.dino",
+            aggregator="attention",
+            freeze_backbone=True,
+            use_dino_segmentation=True,
+            dino_segmentation_model="vit_base_patch16_224.dino",
+            dino_segmenation_threshold=0.6,
+            use_tabular=True,
+            tabular_features=("N", "E", "circumference_cm", "fungal_infection"),
+            tabular_hidden_dim=64,
+        )
+        self.training = TrainConfig(lr=5e-5, epochs=60, use_amp=True)
+        self.data = DataConfig(augmentation="heavy", augmentation_copies=3)
+        self.paths = PathConfig()
+        super().__post_init__()
+
+
+class DINOv2BaseDINOTabular(Config):
+    """DINOv2 ViT-Base backbone (much stronger SSL pretraining) + DINO seg + tabular."""
+    def __post_init__(self):
+        self.model = ModelConfig(
+            backbone="vit_base_patch14_dinov2",
+            aggregator="attention",
+            freeze_backbone=True,
+            use_dino_segmentation=True,
+            dino_segmentation_model="vit_base_patch14_dinov2",
+            dino_segmenation_threshold=0.6,
+            use_tabular=True,
+            tabular_features=("N", "E", "circumference_cm", "fungal_infection"),
+            tabular_hidden_dim=64,
+        )
+        self.training = TrainConfig(lr=5e-5, epochs=60, use_amp=True)
+        self.data = DataConfig(augmentation="heavy", augmentation_copies=3)
+        self.paths = PathConfig()
+        super().__post_init__()
+
+
+class DINOv2LargeDINOTabular(Config):
+    """DINOv2 ViT-Large (1024-dim, ~18 GB fp16 on A100) + DINO seg + tabular.
+    Best quality option — fits comfortably in 40 GB VRAM."""
+    def __post_init__(self):
+        self.model = ModelConfig(
+            backbone="vit_large_patch14_dinov2",
+            aggregator="attention",
+            freeze_backbone=True,
+            use_dino_segmentation=True,
+            dino_segmentation_model="vit_base_patch14_dinov2",   # seg model stays base
+            dino_segmenation_threshold=0.6,
+            use_tabular=True,
+            tabular_features=("N", "E", "circumference_cm", "fungal_infection"),
+            tabular_hidden_dim=64,
+        )
+        self.training = TrainConfig(lr=2e-5, epochs=80, use_amp=True)
+        self.data = DataConfig(augmentation="heavy", augmentation_copies=3)
+        self.paths = PathConfig()
+        super().__post_init__()
+
 
 if __name__ == "__main__":
     cfg = Config()

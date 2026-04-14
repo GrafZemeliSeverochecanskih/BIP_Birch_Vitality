@@ -67,7 +67,8 @@ def run_cv(df, config):
             augmentation=config.data.augmentation,
             tabular_mean=tabular_mean,
             tabular_std=tabular_std,
-            tabular_features=config.model.tabular_features
+            tabular_features=config.model.tabular_features,
+            n_copies=getattr(config.data, "augmentation_copies", 1),
         )
         
         n_tab = len(config.model.tabular_features) if config.model.use_tabular else 0

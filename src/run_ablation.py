@@ -1,4 +1,5 @@
 import sys
+import argparse
 import time
 from pathlib import Path
 from datetime import datetime
@@ -25,6 +26,7 @@ COLUMN_NAME = {
     "fungal infection (3 - worst)": "fungal_infection",
 }
 
+# ── Original ablation configs (unchanged — checkpoints preserved) ──────────────
 ABLATION_CONFIGS = [
     {
         "name": "ViT_baseline",
@@ -45,6 +47,43 @@ ABLATION_CONFIGS = [
         "name": "ViT_DINO_Tabular",
         "use_dino_segmentation": True,
         "use_tabular": True,
+    },
+]
+
+# ── Advanced model configs (larger backbones, DINOv2, heavy augmentation) ──────
+ADVANCED_ABLATION_CONFIGS = [
+    {
+        "name": "ViTBase_DINO_Tabular",
+        "backbone": "vit_base_patch16_224.dino",
+        "seg_model": "vit_base_patch16_224.dino",
+        "use_dino_segmentation": True,
+        "use_tabular": True,
+        "lr": 5e-5,
+        "epochs": 60,
+        "augmentation": "heavy",
+        "augmentation_copies": 3,
+    },
+    {
+        "name": "DINOv2Base_DINO_Tabular",
+        "backbone": "vit_base_patch14_dinov2",
+        "seg_model": "vit_base_patch14_dinov2",
+        "use_dino_segmentation": True,
+        "use_tabular": True,
+        "lr": 5e-5,
+        "epochs": 60,
+        "augmentation": "heavy",
+        "augmentation_copies": 3,
+    },
+    {
+        "name": "DINOv2Large_DINO_Tabular",
+        "backbone": "vit_large_patch14_dinov2",
+        "seg_model": "vit_base_patch14_dinov2",   # seg stays at base — saves VRAM
+        "use_dino_segmentation": True,
+        "use_tabular": True,
+        "lr": 2e-5,
+        "epochs": 80,
+        "augmentation": "heavy",
+        "augmentation_copies": 3,
     },
 ]
 
@@ -71,6 +110,34 @@ def build_ablation_config(ablation: dict) -> Config:
         model=model_cfg,
         training=TrainConfig(lr=5e-5, epochs=60),
         data=DataConfig(),
+        paths=PathConfig(),
+    )
+    return cfg
+
+
+def build_advanced_ablation_config(ablation: dict) -> Config:
+    model_cfg = ModelConfig(
+        backbone=ablation["backbone"],
+        aggregator="attention",
+        freeze_backbone=True,
+        use_dino_segmentation=ablation["use_dino_segmentation"],
+        dino_segmentation_model=ablation["seg_model"],
+        dino_segmenation_threshold=0.6,
+        use_tabular=ablation["use_tabular"],
+        tabular_features=("N", "E", "circumference_cm", "fungal_infection") if ablation["use_tabular"] else (),
+        tabular_hidden_dim=64,
+    )
+    cfg = Config(
+        model=model_cfg,
+        training=TrainConfig(
+            lr=ablation.get("lr", 5e-5),
+            epochs=ablation.get("epochs", 60),
+            use_amp=True,
+        ),
+        data=DataConfig(
+            augmentation=ablation.get("augmentation", "heavy"),
+            augmentation_copies=ablation.get("augmentation_copies", 3),
+        ),
         paths=PathConfig(),
     )
     return cfg
@@ -143,10 +210,11 @@ def _train_and_eval_test(df_train_val, df_test, cfg, fold_results, device):
     return test_m
 
 
-def run_ablation():
+def run_ablation(advanced: bool = False):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
-    print(f"Starting ablation at {datetime.now().isoformat()}")
+    mode_tag = "ADVANCED" if advanced else "ORIGINAL"
+    print(f"Starting {mode_tag} ablation at {datetime.now().isoformat()}")
     print("=" * 60)
 
     base_cfg = Config()
@@ -173,8 +241,9 @@ def run_ablation():
     print("=" * 60)
 
     all_rows = []
+    configs_to_run = ADVANCED_ABLATION_CONFIGS if advanced else ABLATION_CONFIGS
 
-    for ablation in ABLATION_CONFIGS:
+    for ablation in configs_to_run:
         name = ablation["name"]
         print("\n" + "█" * 60)
         print(f"ABLATION: {name}")
@@ -182,7 +251,7 @@ def run_ablation():
         print(f"Tabular features: {ablation['use_tabular']}")
         print("█" * 60 + "\n")
 
-        cfg = build_ablation_config(ablation)
+        cfg = build_advanced_ablation_config(ablation) if advanced else build_ablation_config(ablation)
         cfg.display()
 
         t0 = time.time()
@@ -229,7 +298,8 @@ def run_ablation():
         print(f"Test MAE = {test_m['mae']:.4f} | Test R^2 = {test_m['r2']:.4f}")
 
     results_df = pd.DataFrame(all_rows)
-    output_path = Path("outputs") / "ablation_results.csv"
+    fname = "ablation_advanced_results.csv" if advanced else "ablation_results.csv"
+    output_path = Path("outputs") / fname
     output_path.parent.mkdir(parents=True, exist_ok=True)
     results_df.to_csv(output_path, index=False)
 
@@ -248,4 +318,12 @@ def run_ablation():
 
 
 if __name__ == "__main__":
-    run_ablation()
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--advanced",
+        action="store_true",
+        help="Run advanced model ablations (ViT-Base, DINOv2-Base, DINOv2-Large) "
+             "instead of the original small-model ablations.",
+    )
+    args = parser.parse_args()
+    run_ablation(advanced=args.advanced)
