@@ -8,7 +8,7 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 from config.config import Config
 
 def get_backbone(name, pretrained=True):
-    is_dino = ".dino" in name
+    is_dino = ".dino" in name or "dinov2" in name
 
     if is_dino and pretrained:
         # DINO-pretrained ViTs ship with "norm.weight/bias" but newer timm
