@@ -41,7 +41,13 @@ def save_checkpoint(path, model, optimizer, scheduler, epoch, best_loss, scaler=
     Path(tmp_path).replace(path)
 
 def load_checkpoint(path, model, optimizer, scheduler, scaler=None):
-    checkpoint = torch.load(path, weights_only=False)
+    try:
+        checkpoint = torch.load(path, weights_only=False)
+    except Exception as e:
+        print(f"WARNING: checkpoint {path} is corrupt ({e}). Deleting and restarting fold from epoch 1.")
+        Path(path).unlink(missing_ok=True)
+        return None, None  # signals caller to start fresh
+
     # strict=False: frozen backbone stays as pretrained-init; only trainable params restored
     model.load_state_dict(checkpoint["model_state"], strict=False)
     optimizer.load_state_dict(checkpoint["optimizer_state"])
@@ -219,10 +225,13 @@ def train_fold(
 
     if should_resume and resume_path.exists():
         print(f"Resume fold {fold} from {resume_path}")
-        start_epoch, best_loss = load_checkpoint(resume_path, model, optimizer, scheduler, scaler)
-        early_stopping.best_loss = best_loss
-        start_epoch += 1
-        print(f"Resumed from epoch {start_epoch - 1}")
+        resumed_epoch, best_loss = load_checkpoint(resume_path, model, optimizer, scheduler, scaler)
+        if resumed_epoch is not None:
+            early_stopping.best_loss = best_loss
+            start_epoch = resumed_epoch + 1
+            print(f"Resumed from epoch {resumed_epoch}")
+        else:
+            print(f"Starting fold {fold} from scratch.")
 
     # Append to existing history if resuming, otherwise start fresh
     hist_mode = "a" if (start_epoch > 1 and history_path.exists()) else "w"
