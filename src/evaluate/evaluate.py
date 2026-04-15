@@ -27,29 +27,58 @@ def run_cv(df, config):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
     print(f"Running {config.training.cv_folds}-fold CV on {len(df)} trees")
-    
+
     vitality_bins = make_vitality_bins(df["vitality"])
-    
+
     skf = StratifiedKFold(
         n_splits=config.training.cv_folds,
         shuffle=True,
         random_state=42
     )
-    
-    fold_results = list()
-    all_histories = list()
-    
+
+    # Load any fold results already saved to disk so we can skip completed folds
+    cv_csv = config.paths.log_dir / "cv_results.csv"
+    existing_folds = {}
+    if cv_csv.exists():
+        try:
+            existing_cv = pd.read_csv(cv_csv)
+            for _, row in existing_cv.iterrows():
+                existing_folds[int(row["fold"])] = row.to_dict()
+        except Exception:
+            pass
+
+    fold_results = []
+
     for fold, (train_idx, val_idx) in enumerate(skf.split(df, vitality_bins), start=1):
+        checkpoint_path = config.paths.checkpoint_dir / f"fold_{fold}_best.pt"
+
+        # Skip fold if best checkpoint and saved metrics both exist
+        if fold in existing_folds and checkpoint_path.exists():
+            row = existing_folds[fold]
+            print("="*50)
+            print(f"FOLD {fold} / {config.training.cv_folds} — skipping (already completed)")
+            print(f"  MAE={row['best_val_mae']:.4f} | R²={row['best_val_r2']:.4f} | epoch={int(row['best_epoch'])}")
+            print("="*50)
+            fold_results.append({
+                "fold": fold,
+                "best_val_loss": float(row["best_val_loss"]),
+                "best_val_mae": float(row["best_val_mae"]),
+                "best_val_r2": float(row["best_val_r2"]),
+                "best_epoch": int(row["best_epoch"]),
+                "tabular_mean": row.get("tabular_mean", "{}"),
+                "tabular_std": row.get("tabular_std", "{}"),
+            })
+            continue
+
         print("="*50)
         print(f"FOLD {fold} / {config.training.cv_folds}")
         print(f"Train: {len(train_idx)} trees | Val: {len(val_idx)} trees")
         print("="*50)
-        
+
         train_df = df.iloc[train_idx].reset_index(drop=True)
         val_df = df.iloc[val_idx].reset_index(drop=True)
-        
-        tabular_mean, tabular_std = dict(), dict()
 
+        tabular_mean, tabular_std = dict(), dict()
         if config.model.use_tabular and config.model.tabular_features:
             tabular_mean, tabular_std = compute_tabular_stats(
                 train_df, config.model.tabular_features
@@ -59,10 +88,10 @@ def run_cv(df, config):
         train_loader, val_loader = build_dataloaders(
             train_df,
             val_df,
-            image_dir = config.paths.image_dir,
-            batch_size = config.training.batch_size,
-            num_workers = config.data.num_workers,
-            image_size = config.data.image_size,
+            image_dir=config.paths.image_dir,
+            batch_size=config.training.batch_size,
+            num_workers=config.data.num_workers,
+            image_size=config.data.image_size,
             image_extensions=config.data.image_extensions,
             augmentation=config.data.augmentation,
             tabular_mean=tabular_mean,
@@ -70,26 +99,30 @@ def run_cv(df, config):
             tabular_features=config.model.tabular_features,
             n_copies=getattr(config.data, "augmentation_copies", 1),
         )
-        
-        n_tab = len(config.model.tabular_features) if config.model.use_tabular else 0
 
+        n_tab = len(config.model.tabular_features) if config.model.use_tabular else 0
         model = BirchVitalityModel(
-            backbone_name = config.model.backbone,
-            aggregator_name = config.model.aggregator,
-            hidden_dim = config.model.hidden_dim,
-            dropout = config.model.dropout,
-            pretrained = config.model.pretrained,
-            freeze_backbone = config.model.freeze_backbone,
+            backbone_name=config.model.backbone,
+            aggregator_name=config.model.aggregator,
+            hidden_dim=config.model.hidden_dim,
+            dropout=config.model.dropout,
+            pretrained=config.model.pretrained,
+            freeze_backbone=config.model.freeze_backbone,
             use_dino=config.model.use_dino_segmentation,
             dino_seg_threshold=config.model.dino_segmenation_threshold,
             dino_seg_model=config.model.dino_segmentation_model,
             use_tabular=config.model.use_tabular,
             n_tabular_features=n_tab,
-            tabular_hidden_dim=config.model.tabular_hidden_dim
+            tabular_hidden_dim=config.model.tabular_hidden_dim,
         )
-        
+
         result = train_fold(model, train_loader, val_loader, config, fold, device)
-        fold_results.append({
+
+        # Free GPU memory before next fold
+        del model, train_loader, val_loader
+        torch.cuda.empty_cache()
+
+        fr = {
             "fold": fold,
             "best_val_loss": result["best_val_loss"],
             "best_val_mae": result["best_val_mae"],
@@ -97,52 +130,38 @@ def run_cv(df, config):
             "best_epoch": result["best_epoch"],
             "tabular_mean": str(tabular_mean),
             "tabular_std": str(tabular_std),
-        })
-        
-        all_histories.append(result["history"])
+        }
+        fold_results.append(fr)
+
+        # Persist fold result immediately so a crash on a later fold doesn't lose this one
+        _save_fold_results(fold_results, config)
 
         stats = train_df['vitality'].describe()[['mean', 'std', 'min', 'max']].to_dict()
         print(f"Train vitality: {stats}")
         stats = val_df['vitality'].describe()[['mean', 'std', 'min', 'max']].to_dict()
         print(f"Val vitality: {stats}")
-        
-        print(f"Fold {fold} best ->"
-            f"loss: {result['best_val_loss']:.4f} |"
-            f"MAE: {result['best_val_mae']:.4f} |"
-            f"R^2: {result['best_val_r2']:.4f} |"
-            f"(epoch: {result['best_epoch']})"
-            )
-        
+        print(f"Fold {fold} best -> "
+              f"loss: {result['best_val_loss']:.4f} | "
+              f"MAE: {result['best_val_mae']:.4f} | "
+              f"R^2: {result['best_val_r2']:.4f} | "
+              f"(epoch: {result['best_epoch']})")
+
     results_df = pd.DataFrame(fold_results)
-    _save_logs(results_df, all_histories, config)
+    _save_fold_results(fold_results, config)  # final write (covers all-skipped case)
     summary = _print_summary(results_df, config)
-        
+
     return {
         "fold_results": fold_results,
         "summary": summary,
-        "histories": all_histories
     }
         
-def _save_logs(results_df, histories, config):
+def _save_fold_results(fold_results, config):
+    """Write fold-level metrics to cv_results.csv. Called after each fold and at the end."""
     log_dir = config.paths.log_dir
+    log_dir.mkdir(parents=True, exist_ok=True)
     summary_path = log_dir / "cv_results.csv"
-    results_df.to_csv(summary_path, index=False)
-    print(f"Saved fold results")
-    
-    for fold_idx, history in enumerate(histories, start=1):
-        n_epochs = len(history["train_loss"])
-        history_df = pd.DataFrame({
-            "epoch": list(range(1, n_epochs+1)),
-            "train_loss": history["train_loss"],
-            "train_mae": history["train_mae"],
-            "train_r2": history["train_r2"],
-            "val_loss": history["val_loss"],
-            "val_mae": history["val_mae"],
-            "val_r2": history["val_r2"],
-        })
-        history_path = log_dir / f"fold_{fold_idx}_history.csv"
-        history_df.to_csv(history_path, index=False)
-    print(f"Saved epoch histories -> {log_dir}/fold_*_history.csv")
+    pd.DataFrame(fold_results).to_csv(summary_path, index=False)
+    print(f"Saved fold results -> {summary_path}")
     
 def _print_summary(results_df, config):
     print("="*50)

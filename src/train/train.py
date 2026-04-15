@@ -1,3 +1,4 @@
+import csv
 import time
 from pathlib import Path
 
@@ -22,25 +23,49 @@ def r2_score(preds, targets):
     return (1 - ss_res/ss_tot).item()
 
 def save_checkpoint(path, model, optimizer, scheduler, epoch, best_loss, scaler=None):
+    # Only save trainable parameters — frozen backbone weights are unchanged from
+    # their pretrained init and don't need to be written to disk every epoch.
+    trainable_names = {name for name, p in model.named_parameters() if p.requires_grad}
+    trainable_state = {k: v for k, v in model.state_dict().items() if k in trainable_names}
     d = {
         "epoch": epoch,
-        "model_state": model.state_dict(),
+        "model_state": trainable_state,
         "optimizer_state": optimizer.state_dict(),
         "scheduler_state": scheduler.state_dict(),
         "best_loss": best_loss,
     }
     if scaler is not None:
         d["scaler_state"] = scaler.state_dict()
-    torch.save(d, path)
+    tmp_path = str(path) + ".tmp"
+    torch.save(d, tmp_path)
+    Path(tmp_path).replace(path)
 
 def load_checkpoint(path, model, optimizer, scheduler, scaler=None):
     checkpoint = torch.load(path, weights_only=False)
-    model.load_state_dict(checkpoint["model_state"])
+    # strict=False: frozen backbone stays as pretrained-init; only trainable params restored
+    model.load_state_dict(checkpoint["model_state"], strict=False)
     optimizer.load_state_dict(checkpoint["optimizer_state"])
     scheduler.load_state_dict(checkpoint["scheduler_state"])
     if scaler is not None and "scaler_state" in checkpoint:
         scaler.load_state_dict(checkpoint["scaler_state"])
     return checkpoint["epoch"], checkpoint["best_loss"]
+
+def predict_loader(model, loader, device):
+    """Run inference over a loader and return per-tree (tree_id, pred, target) lists."""
+    model.eval()
+    tree_ids, preds, targets = [], [], []
+
+    with torch.no_grad():
+        for batch in loader:
+            images = [img.to(device) for img in batch["images"]]
+            tabular = batch["tabular"].to(device) if "tabular" in batch else None
+            out = model(images, tabular).cpu()
+            preds.extend(out.tolist())
+            targets.extend(batch["vitality"].tolist())
+            tree_ids.extend(batch["tree_id"])
+
+    return tree_ids, preds, targets
+
 
 def train_epoch(
     model,
@@ -140,7 +165,10 @@ class EarlyStopping:
             self.counter = 0
             self.best_epoch = epoch
             if self.checkpoint_path is not None:
-                torch.save(model.state_dict(), self.checkpoint_path)
+                # Only save trainable params — frozen backbone unchanged from pretrained init
+                trainable_names = {name for name, p in model.named_parameters() if p.requires_grad}
+                trainable_state = {k: v for k, v in model.state_dict().items() if k in trainable_names}
+                torch.save(trainable_state, self.checkpoint_path)
         else:
             self.counter += 1
 
@@ -181,22 +209,10 @@ def train_fold(
         checkpoint_path=checkpoint_path
     )
     
-    history = {
-        "train_loss": list(),
-        "train_mae": list(),
-        "train_r2": list(),
-        "val_loss": list(),
-        "val_mae": list(),
-        "val_r2": list(),
-    }
-    
-    print("=" * 50)
-    print(f"Fold {fold} - training for up to {config.training.epochs} epochs")
-    print("=" * 50)
-    print(f"{'Epoch':>6} | {'Train Loss':>10} | {'Train MAE':>10} | {'Train R^2':>9} |"
-          f"{'Val Loss':>9} | {'Val MAE':>9} | {'Val R^2':>8} |")
-    print("="*70)
-    
+    # Stream epoch history to disk — no in-memory accumulation
+    history_path = config.paths.log_dir / f"fold_{fold}_history.csv"
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+
     start_epoch = 1
     resume_path = config.paths.checkpoint_dir / f"fold_{fold}_resume.pt"
     should_resume = getattr(config.training, "resume", True)
@@ -208,21 +224,36 @@ def train_fold(
         start_epoch += 1
         print(f"Resumed from epoch {start_epoch - 1}")
 
+    # Append to existing history if resuming, otherwise start fresh
+    hist_mode = "a" if (start_epoch > 1 and history_path.exists()) else "w"
+    hist_file = open(history_path, hist_mode, newline="")
+    hist_writer = csv.writer(hist_file)
+    if hist_mode == "w":
+        hist_writer.writerow(["epoch", "train_loss", "train_mae", "train_r2", "val_loss", "val_mae", "val_r2"])
+
+    print("=" * 50)
+    print(f"Fold {fold} - training for up to {config.training.epochs} epochs")
+    print("=" * 50)
+    print(f"{'Epoch':>6} | {'Train Loss':>10} | {'Train MAE':>10} | {'Train R^2':>9} |"
+          f"{'Val Loss':>9} | {'Val MAE':>9} | {'Val R^2':>8} |")
+    print("="*70)
+
+    epochs_run = 0
     for epoch in range(start_epoch, config.training.epochs + 1):
         t0 = time.time()
         train_metrics = train_epoch(model, train_loader, optimizer, criterion, device, scaler=scaler)
         val_metrics = val_epoch(model, val_loader, criterion, device)
         scheduler.step(val_metrics["loss"])
-        
-        history["train_loss"].append(train_metrics["loss"])
-        history["train_mae"].append(train_metrics["mae"])
-        history["train_r2"].append(train_metrics["r2"])
-        history["val_loss"].append(val_metrics["loss"])
-        history["val_mae"].append(val_metrics["mae"])
-        history["val_r2"].append(val_metrics["r2"])
-        
+
+        hist_writer.writerow([
+            epoch,
+            round(train_metrics["loss"], 6), round(train_metrics["mae"], 6), round(train_metrics["r2"], 6),
+            round(val_metrics["loss"], 6), round(val_metrics["mae"], 6), round(val_metrics["r2"], 6),
+        ])
+        hist_file.flush()
+        epochs_run += 1
+
         elapsed = time.time() - t0
-        
         print(
             f"{epoch:>6} | "
             f"{train_metrics['loss']:>10.4f} | "
@@ -233,7 +264,7 @@ def train_fold(
             f"{val_metrics['r2']:>10.4f} | "
             f"({elapsed:.1f} s)"
         )
-        
+
         stop = early_stopping.step(val_metrics["loss"], model, epoch, mae=val_metrics["mae"], r2=val_metrics["r2"])
         if stop:
             print(f"Early stopping at epoch {epoch}"
@@ -241,15 +272,17 @@ def train_fold(
                   f"(best val loss: {early_stopping.best_loss:.4f})"
                   )
             break
-        
+
         save_checkpoint(resume_path, model, optimizer, scheduler, epoch, early_stopping.best_loss, scaler=scaler)
 
+    hist_file.close()
+
     if checkpoint_path.exists():
-        model.load_state_dict(torch.load(checkpoint_path, weights_only=True))
+        model.load_state_dict(torch.load(checkpoint_path, weights_only=True), strict=False)
         print(f"Loaded best weights from {checkpoint_path}")
 
     # If no epochs ran this session (fully resumed), compute metrics from the loaded model
-    if not history["val_mae"]:
+    if epochs_run == 0:
         val_metrics = val_epoch(model, val_loader, criterion, device)
         best_mae = val_metrics["mae"]
         best_r2 = val_metrics["r2"]
@@ -262,7 +295,6 @@ def train_fold(
         "best_val_mae": best_mae,
         "best_val_r2": best_r2,
         "best_epoch": early_stopping.best_epoch,
-        "history": history
     }
     
 if __name__ == "__main__":

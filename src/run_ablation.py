@@ -15,7 +15,7 @@ from config.config import Config, ModelConfig, TrainConfig, DataConfig, PathConf
 from dataset.dataset import BirchDataset, collate_fn, compute_tabular_stats, filter_trees_with_images
 from evaluate.evaluate import run_cv, make_vitality_bins
 from model.model import BirchVitalityModel
-from train.train import train_epoch, val_epoch
+from train.train import train_epoch, val_epoch, predict_loader
 from sklearn.model_selection import train_test_split
 
 COLUMN_NAME = {
@@ -143,8 +143,21 @@ def build_advanced_ablation_config(ablation: dict) -> Config:
     return cfg
 
 
-def _train_and_eval_test(df_train_val, df_test, cfg, fold_results, device):
-    """Train a final model on all train_val data and evaluate on the held-out test set."""
+def _train_and_eval_test(df_train_val, df_test, cfg, fold_results, device, predictions_path=None):
+    """Train a final model on all train_val data and evaluate on the held-out test set.
+
+    If predictions_path is given, saves per-tree predictions to that CSV.
+    Skips training entirely if predictions_path already exists.
+    """
+    if predictions_path is not None and Path(predictions_path).exists():
+        print(f"  Test predictions already exist at {predictions_path} — loading from file.")
+        pred_df = pd.read_csv(predictions_path)
+        mae = pred_df["abs_error"].mean()
+        r2_num = ((pred_df["vitality_true"] - pred_df["vitality_pred"]) ** 2).sum()
+        r2_den = ((pred_df["vitality_true"] - pred_df["vitality_true"].mean()) ** 2).sum()
+        r2 = float(1 - r2_num / r2_den) if r2_den != 0 else 0.0
+        return {"mae": mae, "r2": r2}
+
     tabular_mean, tabular_std = {}, {}
     if cfg.model.use_tabular and cfg.model.tabular_features:
         tabular_mean, tabular_std = compute_tabular_stats(df_train_val, cfg.model.tabular_features)
@@ -199,15 +212,45 @@ def _train_and_eval_test(df_train_val, df_test, cfg, fold_results, device):
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=5)
     criterion = nn.MSELoss()
 
+    use_amp = getattr(cfg.training, "use_amp", False) and device.type == "cuda"
+    from torch.amp import GradScaler
+    scaler = GradScaler(device="cuda") if use_amp else None
+
     for epoch in range(1, mean_best_epoch + 1):
-        m = train_epoch(model, train_loader, optimizer, criterion, device)
+        m = train_epoch(model, train_loader, optimizer, criterion, device, scaler=scaler)
         scheduler.step(m["loss"])
         if epoch % 10 == 0 or epoch == mean_best_epoch:
             print(f"    Epoch {epoch}/{mean_best_epoch} | loss={m['loss']:.4f} | MAE={m['mae']:.4f}")
 
-    test_m = val_epoch(model, test_loader, criterion, device)
-    print(f"  Test MAE={test_m['mae']:.4f} | Test R²={test_m['r2']:.4f}")
-    return test_m
+    # Collect per-tree predictions
+    tree_ids, preds, targets = predict_loader(model, test_loader, device)
+    errors = [p - t for p, t in zip(preds, targets)]
+    abs_errors = [abs(e) for e in errors]
+
+    test_mae = sum(abs_errors) / len(abs_errors)
+    ss_res = sum((t - p) ** 2 for p, t in zip(preds, targets))
+    t_mean = sum(targets) / len(targets)
+    ss_tot = sum((t - t_mean) ** 2 for t in targets)
+    test_r2 = float(1 - ss_res / ss_tot) if ss_tot != 0 else 0.0
+
+    print(f"  Test MAE={test_mae:.4f} | Test R²={test_r2:.4f}")
+
+    if predictions_path is not None:
+        pred_df = pd.DataFrame({
+            "tree_id": tree_ids,
+            "vitality_true": targets,
+            "vitality_pred": [round(p, 4) for p in preds],
+            "error": [round(e, 4) for e in errors],
+            "abs_error": [round(e, 4) for e in abs_errors],
+        })
+        Path(predictions_path).parent.mkdir(parents=True, exist_ok=True)
+        pred_df.to_csv(predictions_path, index=False)
+        print(f"  Per-tree predictions saved -> {predictions_path}")
+
+    del model, train_loader, test_loader
+    torch.cuda.empty_cache()
+
+    return {"mae": test_mae, "r2": test_r2}
 
 
 def run_ablation(advanced: bool = False):
@@ -240,11 +283,32 @@ def run_ablation(advanced: bool = False):
     print(f"Train/val: {len(df_train_val)} trees | Test hold-out: {len(df_test)} trees")
     print("=" * 60)
 
-    all_rows = []
+    fname = "ablation_advanced_results.csv" if advanced else "ablation_results.csv"
+    output_path = Path("outputs") / fname
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Load any previously saved results so we can skip completed experiments
+    if output_path.exists():
+        existing_df = pd.read_csv(output_path)
+        all_rows = existing_df.to_dict("records")
+        done_experiments = set(existing_df[existing_df["type"] == "summary"]["experiment"].tolist())
+        print(f"Found existing results in {output_path}")
+        print(f"Already completed: {sorted(done_experiments)}")
+    else:
+        all_rows = []
+        done_experiments = set()
+
     configs_to_run = ADVANCED_ABLATION_CONFIGS if advanced else ABLATION_CONFIGS
 
     for ablation in configs_to_run:
         name = ablation["name"]
+
+        if name in done_experiments:
+            print(f"\n{'─' * 60}")
+            print(f"SKIPPING {name} — already in {output_path.name}")
+            print(f"{'─' * 60}")
+            continue
+
         print("\n" + "█" * 60)
         print(f"ABLATION: {name}")
         print(f"DINO segmentation : {ablation['use_dino_segmentation']}")
@@ -259,9 +323,10 @@ def run_ablation(advanced: bool = False):
         elapsed = time.time() - t0
 
         summary = results["summary"]
+        new_rows = []
 
         for fr in results["fold_results"]:
-            all_rows.append({
+            new_rows.append({
                 "experiment": name,
                 "use_dino": ablation["use_dino_segmentation"],
                 "use_tabular": ablation["use_tabular"],
@@ -275,10 +340,16 @@ def run_ablation(advanced: bool = False):
                 "type": "fold",
             })
 
-        print(f"\nEvaluating {name} on held-out test set ({len(df_test)} trees)...")
-        test_m = _train_and_eval_test(df_train_val, df_test, cfg, results["fold_results"], device)
+        pred_fname = "test_predictions_advanced" if advanced else "test_predictions"
+        predictions_path = Path("outputs") / f"{pred_fname}_{name}.csv"
 
-        all_rows.append({
+        print(f"\nEvaluating {name} on held-out test set ({len(df_test)} trees)...")
+        test_m = _train_and_eval_test(
+            df_train_val, df_test, cfg, results["fold_results"], device,
+            predictions_path=predictions_path,
+        )
+
+        new_rows.append({
             "experiment": name,
             "use_dino": ablation["use_dino_segmentation"],
             "use_tabular": ablation["use_tabular"],
@@ -292,17 +363,19 @@ def run_ablation(advanced: bool = False):
             "type": "summary",
         })
 
+        all_rows.extend(new_rows)
+        done_experiments.add(name)
+
+        # Save immediately after each experiment — crash-safe
+        pd.DataFrame(all_rows).to_csv(output_path, index=False)
+
         print(f"\n {name} completed in {elapsed/60:.1f} min")
         print(f"CV  MAE = {summary['mean_val_mae']:.4f} ± {summary['std_val_mae']:.4f}")
         print(f"CV  R^2 = {summary['mean_val_r2']:.4f} ± {summary['std_val_r2']:.4f}")
         print(f"Test MAE = {test_m['mae']:.4f} | Test R^2 = {test_m['r2']:.4f}")
+        print(f"Results saved -> {output_path}")
 
     results_df = pd.DataFrame(all_rows)
-    fname = "ablation_advanced_results.csv" if advanced else "ablation_results.csv"
-    output_path = Path("outputs") / fname
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    results_df.to_csv(output_path, index=False)
-
     print("\n" + "=" * 60)
     print("ABLATION COMPLETE")
     print("=" * 60)
