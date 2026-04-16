@@ -245,6 +245,21 @@ def vitality_to_class(v: float) -> int:
     return math.ceil(v) - 1
 
 
+def vitality_to_class3(v: float) -> int:
+    """
+    Coarse 3-class mapping:
+      0 — low     (vitality <= 1)
+      1 — medium  (1 < vitality <= 3)
+      2 — high    (vitality > 3)
+    """
+    if v <= 1.0:
+        return 0
+    elif v <= 3.0:
+        return 1
+    else:
+        return 2
+
+
 class BirchClassificationDataset(Dataset):
     """
     Same image-bag loading as BirchDataset but returns an integer class label
@@ -262,6 +277,7 @@ class BirchClassificationDataset(Dataset):
         tabular_mean=None,
         tabular_std=None,
         n_copies: int = 1,
+        class_fn=None,
     ):
         self.df = df.reset_index(drop=True)
         self.image_dir = image_dir
@@ -271,6 +287,7 @@ class BirchClassificationDataset(Dataset):
         self.tabular_mean = tabular_mean or {f: 0.0 for f in tabular_features}
         self.tabular_std = tabular_std or {f: 1.0 for f in tabular_features}
         self.n_copies = n_copies if mode == "train" else 1
+        self.class_fn = class_fn if class_fn is not None else vitality_to_class
         self.image_paths = self._index_to_images()
 
     def _index_to_images(self):
@@ -290,7 +307,7 @@ class BirchClassificationDataset(Dataset):
         real_index = index % len(self.df)
         row = self.df.iloc[real_index]
         paths = self.image_paths[real_index]
-        label = torch.tensor(vitality_to_class(float(row["vitality"])), dtype=torch.long)
+        label = torch.tensor(self.class_fn(float(row["vitality"])), dtype=torch.long)
 
         images = list()
         for p in paths:
@@ -347,6 +364,7 @@ def build_cls_dataloaders(
     tabular_mean=None,
     tabular_std=None,
     n_copies: int = 1,
+    class_fn=None,
 ):
     shared = dict(
         image_dir=image_dir,
@@ -356,6 +374,7 @@ def build_cls_dataloaders(
         tabular_mean=tabular_mean,
         tabular_std=tabular_std,
         image_extension=image_extensions,
+        class_fn=class_fn,
     )
 
     train_dataset = BirchClassificationDataset(train_df, **shared, mode="train", n_copies=n_copies)

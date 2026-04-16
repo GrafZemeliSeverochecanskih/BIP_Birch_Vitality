@@ -14,6 +14,7 @@ from dataset.dataset import (
     compute_tabular_stats,
     filter_trees_with_images,
     vitality_to_class,
+    vitality_to_class3,
 )
 from model.model import BirchVitalityClassifier
 from train.train_cls import compute_class_weights, train_cls_fold
@@ -27,13 +28,19 @@ def make_vitality_classes(vitality_series):
     return vitality_series.apply(lambda v: vitality_to_class(float(v)))
 
 
-def run_cls_cv(df, config, num_classes=NUM_CLASSES):
+def make_vitality_classes3(vitality_series):
+    """Map continuous vitality to 3 coarse class labels for stratification."""
+    return vitality_series.apply(lambda v: vitality_to_class3(float(v)))
+
+
+def run_cls_cv(df, config, num_classes=NUM_CLASSES, class_fn=None):
+    _class_fn = class_fn if class_fn is not None else vitality_to_class
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
     print(f"Running {config.training.cv_folds}-fold classification CV on {len(df)} trees")
 
     # Stratify on integer class labels
-    cls_labels = make_vitality_classes(df["vitality"])
+    cls_labels = df["vitality"].apply(lambda v: _class_fn(float(v)))
 
     skf = StratifiedKFold(
         n_splits=config.training.cv_folds,
@@ -73,10 +80,11 @@ def run_cls_cv(df, config, num_classes=NUM_CLASSES):
             tabular_mean=tabular_mean,
             tabular_std=tabular_std,
             tabular_features=config.model.tabular_features,
+            class_fn=_class_fn,
         )
 
         # Compute class weights from training fold
-        train_labels = [vitality_to_class(float(v)) for v in train_df["vitality"]]
+        train_labels = [_class_fn(float(v)) for v in train_df["vitality"]]
         class_weights = compute_class_weights(train_labels, num_classes)
         print(f"Class weights: {class_weights.tolist()}")
 
