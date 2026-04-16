@@ -7,18 +7,20 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 from config.config import Config
 
-def get_backbone(name, pretrained=True):
+def get_backbone(name, pretrained=True, img_size=224):
     is_dino = ".dino" in name or "dinov2" in name
 
     if is_dino and pretrained:
         # DINO-pretrained ViTs ship with "norm.weight/bias" but newer timm
         # architectures expect "fc_norm.weight/bias".  We load the weights
         # manually with key remapping to avoid the strict-loading error.
+        # img_size is passed explicitly so DINOv2 (default 518) works at 224.
         backbone = timm.create_model(
             name,
             pretrained=False,       # don't auto-load yet
             num_classes=0,
             global_pool="avg",
+            img_size=img_size,
         )
         # Download the official pretrained state dict
         pretrained_cfg = backbone.pretrained_cfg
@@ -48,10 +50,11 @@ def get_backbone(name, pretrained=True):
             pretrained=pretrained,
             num_classes=0,
             global_pool="avg",
+            img_size=img_size,
         )
 
     with torch.no_grad():
-        dummy = torch.zeros(1, 3, 224, 224)
+        dummy = torch.zeros(1, 3, img_size, img_size)
         feature_dim = backbone(dummy).shape[-1]
 
     print(f"Backbone: {name}")
@@ -228,6 +231,7 @@ class BirchVitalityModel(nn.Module):
         dropout=0.3,
         pretrained=True,
         freeze_backbone=False,
+        img_size=224,
 
         use_dino = False,
         dino_seg_model: str = "vit_small_patch16_224.dino",
@@ -235,7 +239,7 @@ class BirchVitalityModel(nn.Module):
 
         use_tabular: bool = False,
         n_tabular_features: int = 0,
-        tabular_hidden_dim: int = 64 
+        tabular_hidden_dim: int = 64
     ):
         super().__init__()
 
@@ -243,7 +247,7 @@ class BirchVitalityModel(nn.Module):
             DINOSegmenter(dino_seg_model, dino_seg_threshold) if use_dino else None
         )
 
-        self.backbone, feature_dim = get_backbone(backbone_name, pretrained)
+        self.backbone, feature_dim = get_backbone(backbone_name, pretrained, img_size=img_size)
         self.aggregator = get_aggregator(aggregator_name, feature_dim)
 
         if freeze_backbone:

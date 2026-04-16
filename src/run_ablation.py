@@ -196,6 +196,7 @@ def _train_and_eval_test(df_train_val, df_test, cfg, fold_results, device, predi
         dropout=cfg.model.dropout,
         pretrained=cfg.model.pretrained,
         freeze_backbone=cfg.model.freeze_backbone,
+        img_size=cfg.data.image_size,
         use_dino=cfg.model.use_dino_segmentation,
         dino_seg_threshold=cfg.model.dino_segmenation_threshold,
         dino_seg_model=cfg.model.dino_segmentation_model,

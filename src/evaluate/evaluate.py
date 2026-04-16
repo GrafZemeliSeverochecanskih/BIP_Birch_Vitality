@@ -108,6 +108,7 @@ def run_cv(df, config):
             dropout=config.model.dropout,
             pretrained=config.model.pretrained,
             freeze_backbone=config.model.freeze_backbone,
+            img_size=config.data.image_size,
             use_dino=config.model.use_dino_segmentation,
             dino_seg_threshold=config.model.dino_segmenation_threshold,
             dino_seg_model=config.model.dino_segmentation_model,
