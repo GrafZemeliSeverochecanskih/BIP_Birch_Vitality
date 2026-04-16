@@ -7,6 +7,37 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 from config.config import Config
 
+def _interpolate_pos_embed(pos_embed_ckpt: torch.Tensor, model: nn.Module) -> torch.Tensor:
+    """
+    Bicubic-interpolate position embeddings from checkpoint resolution to model resolution.
+
+    DINOv2 checkpoints are pretrained at 518×518 (patch 14 → 37×37 = 1369 patches).
+    When the model is built with img_size=224 (16×16 = 256 patches) the shapes don't
+    match.  This function interpolates the spatial patch tokens and leaves the CLS token
+    untouched, exactly mirroring what timm does internally when pretrained=True.
+    """
+    N_ckpt = pos_embed_ckpt.shape[1] - 1   # patches in checkpoint (exclude CLS)
+    N_model = model.pos_embed.shape[1] - 1  # patches expected by model
+
+    if N_ckpt == N_model:
+        return pos_embed_ckpt  # no-op when sizes already match
+
+    cls_token  = pos_embed_ckpt[:, :1, :]   # [1, 1, D]
+    patch_embed = pos_embed_ckpt[:, 1:, :]  # [1, N_ckpt, D]
+
+    D = patch_embed.shape[-1]
+    H_old = W_old = int(N_ckpt ** 0.5)
+    H_new = W_new = int(N_model ** 0.5)
+
+    # Reshape to 2-D spatial grid, interpolate, flatten back
+    patch_embed = patch_embed.reshape(1, H_old, W_old, D).permute(0, 3, 1, 2)  # [1,D,H,W]
+    patch_embed = F.interpolate(patch_embed, size=(H_new, W_new), mode="bicubic", align_corners=False)
+    patch_embed = patch_embed.permute(0, 2, 3, 1).reshape(1, H_new * W_new, D)  # [1,N_new,D]
+
+    print(f"  [pos_embed] interpolated {H_old}×{W_old} → {H_new}×{W_new} patches")
+    return torch.cat([cls_token, patch_embed], dim=1)
+
+
 def get_backbone(name, pretrained=True, img_size=224):
     is_dino = ".dino" in name or "dinov2" in name
 
@@ -38,6 +69,11 @@ def get_backbone(name, pretrained=True, img_size=224):
             elif k == "norm.bias":
                 new_key = "fc_norm.bias"
             remapped[new_key] = v
+
+        # Interpolate position embeddings if checkpoint resolution != model resolution
+        if "pos_embed" in remapped:
+            remapped["pos_embed"] = _interpolate_pos_embed(remapped["pos_embed"], backbone)
+
         # Drop head keys that don't exist (num_classes=0 removes the head)
         missing, unexpected = backbone.load_state_dict(remapped, strict=False)
         if missing:
