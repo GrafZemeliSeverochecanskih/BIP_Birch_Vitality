@@ -2,6 +2,7 @@
 Classification training loop — mirrors train.py but uses CrossEntropyLoss
 with inverse-frequency class weights, and reports accuracy + macro-F1.
 """
+import csv
 import time
 from pathlib import Path
 from collections import Counter
@@ -98,6 +99,23 @@ def train_cls_epoch(model, loader, optimizer, criterion, device, num_classes, sc
         "accuracy": accuracy(all_preds, all_targets),
         "f1": macro_f1(all_preds, all_targets, num_classes),
     }
+
+
+def predict_cls_loader(model, loader, device):
+    """Run inference over a loader; return per-tree (tree_id, pred_class, true_class) lists."""
+    model.eval()
+    tree_ids, pred_classes, true_classes = [], [], []
+
+    with torch.no_grad():
+        for batch in loader:
+            images = [img.to(device) for img in batch["images"]]
+            tabular = batch["tabular"].to(device) if "tabular" in batch else None
+            logits = model(images, tabular).cpu()
+            pred_classes.extend(logits.argmax(dim=1).tolist())
+            true_classes.extend(batch["label"].tolist())
+            tree_ids.extend(batch["tree_id"])
+
+    return tree_ids, pred_classes, true_classes
 
 
 def val_cls_epoch(model, loader, criterion, device, num_classes):

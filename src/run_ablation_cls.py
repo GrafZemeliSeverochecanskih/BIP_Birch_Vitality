@@ -1,4 +1,5 @@
 import sys
+import argparse
 import time
 from pathlib import Path
 from datetime import datetime
@@ -21,7 +22,7 @@ from dataset.dataset import (
 )
 from evaluate.evaluate_cls import run_cls_cv, make_vitality_classes
 from model.model import BirchVitalityClassifier
-from train.train_cls import compute_class_weights, train_cls_epoch, val_cls_epoch
+from train.train_cls import compute_class_weights, train_cls_epoch, val_cls_epoch, predict_cls_loader
 from sklearn.model_selection import train_test_split
 
 COLUMN_NAME = {
@@ -32,6 +33,7 @@ COLUMN_NAME = {
     "fungal infection (3 - worst)": "fungal_infection",
 }
 
+# ── Original ablation configs (unchanged — checkpoints preserved) ──────────────
 ABLATION_CONFIGS = [
     {
         "name": "ViT_baseline",
@@ -52,6 +54,43 @@ ABLATION_CONFIGS = [
         "name": "ViT_DINO_Tabular",
         "use_dino_segmentation": True,
         "use_tabular": True,
+    },
+]
+
+# ── Advanced model configs (larger backbones, DINOv2, heavy augmentation) ──────
+ADVANCED_ABLATION_CONFIGS = [
+    {
+        "name": "ViTBase_DINO_Tabular",
+        "backbone": "vit_base_patch16_224.dino",
+        "seg_model": "vit_base_patch16_224.dino",
+        "use_dino_segmentation": True,
+        "use_tabular": True,
+        "lr": 5e-5,
+        "epochs": 60,
+        "augmentation": "heavy",
+        "augmentation_copies": 3,
+    },
+    {
+        "name": "DINOv2Base_DINO_Tabular",
+        "backbone": "vit_base_patch14_dinov2",
+        "seg_model": "vit_base_patch14_dinov2",
+        "use_dino_segmentation": True,
+        "use_tabular": True,
+        "lr": 5e-5,
+        "epochs": 60,
+        "augmentation": "heavy",
+        "augmentation_copies": 3,
+    },
+    {
+        "name": "DINOv2Large_DINO_Tabular",
+        "backbone": "vit_large_patch14_dinov2",
+        "seg_model": "vit_base_patch14_dinov2",   # seg stays at base — saves VRAM
+        "use_dino_segmentation": True,
+        "use_tabular": True,
+        "lr": 2e-5,
+        "epochs": 80,
+        "augmentation": "heavy",
+        "augmentation_copies": 3,
     },
 ]
 
@@ -84,8 +123,56 @@ def build_cls_ablation_config(ablation: dict) -> ClassificationConfig:
     return cfg
 
 
-def _train_and_eval_test_cls(df_train_val, df_test, cfg, fold_results, device, num_classes):
-    """Train a final classifier on all train_val data and evaluate on the held-out test set."""
+def build_advanced_cls_ablation_config(ablation: dict) -> ClassificationConfig:
+    model_cfg = ModelConfig(
+        backbone=ablation["backbone"],
+        aggregator="attention",
+        freeze_backbone=True,
+        use_dino_segmentation=ablation["use_dino_segmentation"],
+        dino_segmentation_model=ablation["seg_model"],
+        dino_segmenation_threshold=0.6,
+        use_tabular=ablation["use_tabular"],
+        tabular_features=("N", "E", "circumference_cm", "fungal_infection") if ablation["use_tabular"] else (),
+        tabular_hidden_dim=64,
+    )
+    cfg = ClassificationConfig(
+        model=model_cfg,
+        training=TrainConfig(
+            lr=ablation.get("lr", 5e-5),
+            epochs=ablation.get("epochs", 60),
+            use_amp=True,
+        ),
+        data=DataConfig(
+            augmentation=ablation.get("augmentation", "heavy"),
+            augmentation_copies=ablation.get("augmentation_copies", 3),
+        ),
+        paths=PathConfig(),
+        num_classes=5,
+    )
+    return cfg
+
+
+def _train_and_eval_test_cls(df_train_val, df_test, cfg, fold_results, device, num_classes, predictions_path=None):
+    """Train a final classifier on all train_val data and evaluate on the held-out test set.
+
+    If predictions_path is given, saves per-tree predictions to that CSV.
+    Skips training entirely if predictions_path already exists.
+    """
+    if predictions_path is not None and Path(predictions_path).exists():
+        print(f"  Test predictions already exist at {predictions_path} — loading from file.")
+        pred_df = pd.read_csv(predictions_path)
+        acc = pred_df["correct"].mean()
+        f1s = []
+        for c in range(num_classes):
+            tp = ((pred_df["class_pred"] == c) & (pred_df["class_true"] == c)).sum()
+            fp = ((pred_df["class_pred"] == c) & (pred_df["class_true"] != c)).sum()
+            fn = ((pred_df["class_pred"] != c) & (pred_df["class_true"] == c)).sum()
+            prec = tp / (tp + fp + 1e-8)
+            rec = tp / (tp + fn + 1e-8)
+            f1s.append(2 * prec * rec / (prec + rec + 1e-8))
+        f1 = float(sum(f1s) / len(f1s))
+        return {"accuracy": acc, "f1": f1}
+
     tabular_mean, tabular_std = {}, {}
     if cfg.model.use_tabular and cfg.model.tabular_features:
         tabular_mean, tabular_std = compute_tabular_stats(df_train_val, cfg.model.tabular_features)
@@ -144,21 +231,55 @@ def _train_and_eval_test_cls(df_train_val, df_test, cfg, fold_results, device, n
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=5)
     criterion = nn.CrossEntropyLoss(weight=class_weights.to(device))
 
+    use_amp = getattr(cfg.training, "use_amp", False) and device.type == "cuda"
+    from torch.amp import GradScaler
+    scaler = GradScaler(device="cuda") if use_amp else None
+
     for epoch in range(1, mean_best_epoch + 1):
-        m = train_cls_epoch(model, train_loader, optimizer, criterion, device, num_classes)
+        m = train_cls_epoch(model, train_loader, optimizer, criterion, device, num_classes, scaler=scaler)
         scheduler.step(m["loss"])
         if epoch % 10 == 0 or epoch == mean_best_epoch:
             print(f"    Epoch {epoch}/{mean_best_epoch} | loss={m['loss']:.4f} | acc={m['accuracy']:.4f}")
 
-    test_m = val_cls_epoch(model, test_loader, criterion, device, num_classes)
-    print(f"  Test Acc={test_m['accuracy']:.4f} | Test F1={test_m['f1']:.4f}")
-    return test_m
+    # Collect per-tree predictions
+    tree_ids, pred_classes, true_classes = predict_cls_loader(model, test_loader, device)
+    correct = [int(p == t) for p, t in zip(pred_classes, true_classes)]
+
+    test_acc = sum(correct) / len(correct)
+    f1s = []
+    for c in range(num_classes):
+        tp = sum((p == c and t == c) for p, t in zip(pred_classes, true_classes))
+        fp = sum((p == c and t != c) for p, t in zip(pred_classes, true_classes))
+        fn = sum((p != c and t == c) for p, t in zip(pred_classes, true_classes))
+        prec = tp / (tp + fp + 1e-8)
+        rec = tp / (tp + fn + 1e-8)
+        f1s.append(2 * prec * rec / (prec + rec + 1e-8))
+    test_f1 = float(sum(f1s) / len(f1s))
+
+    print(f"  Test Acc={test_acc:.4f} | Test F1={test_f1:.4f}")
+
+    if predictions_path is not None:
+        pred_df = pd.DataFrame({
+            "tree_id": tree_ids,
+            "class_true": true_classes,
+            "class_pred": pred_classes,
+            "correct": correct,
+        })
+        Path(predictions_path).parent.mkdir(parents=True, exist_ok=True)
+        pred_df.to_csv(predictions_path, index=False)
+        print(f"  Per-tree predictions saved -> {predictions_path}")
+
+    del model, train_loader, test_loader
+    torch.cuda.empty_cache()
+
+    return {"accuracy": test_acc, "f1": test_f1}
 
 
-def run_cls_ablation():
+def run_cls_ablation(advanced: bool = False):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
-    print(f"Starting CLASSIFICATION ablation at {datetime.now().isoformat()}")
+    mode_tag = "ADVANCED" if advanced else "ORIGINAL"
+    print(f"Starting {mode_tag} CLASSIFICATION ablation at {datetime.now().isoformat()}")
     print("=" * 60)
 
     base_cfg = ClassificationConfig()
@@ -185,17 +306,39 @@ def run_cls_ablation():
     print(f"Train/val: {len(df_train_val)} trees | Test hold-out: {len(df_test)} trees")
     print("=" * 60)
 
-    all_rows = []
+    fname = "ablation_cls_advanced_results.csv" if advanced else "ablation_cls_results.csv"
+    output_path = Path("outputs") / fname
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    for ablation in ABLATION_CONFIGS:
+    # Load any previously saved results so we can skip completed experiments
+    if output_path.exists():
+        existing_df = pd.read_csv(output_path)
+        all_rows = existing_df.to_dict("records")
+        done_experiments = set(existing_df[existing_df["type"] == "summary"]["experiment"].tolist())
+        print(f"Found existing results in {output_path}")
+        print(f"Already completed: {sorted(done_experiments)}")
+    else:
+        all_rows = []
+        done_experiments = set()
+
+    configs_to_run = ADVANCED_ABLATION_CONFIGS if advanced else ABLATION_CONFIGS
+
+    for ablation in configs_to_run:
         name = ablation["name"]
+
+        if name in done_experiments:
+            print(f"\n{'─' * 60}")
+            print(f"SKIPPING {name} — already in {output_path.name}")
+            print(f"{'─' * 60}")
+            continue
+
         print("\n" + "█" * 60)
         print(f"ABLATION (CLS): {name}")
         print(f"DINO segmentation : {ablation['use_dino_segmentation']}")
         print(f"Tabular features: {ablation['use_tabular']}")
         print("█" * 60 + "\n")
 
-        cfg = build_cls_ablation_config(ablation)
+        cfg = build_advanced_cls_ablation_config(ablation) if advanced else build_cls_ablation_config(ablation)
         cfg.display()
 
         t0 = time.time()
@@ -203,9 +346,10 @@ def run_cls_ablation():
         elapsed = time.time() - t0
 
         summary = results["summary"]
+        new_rows = []
 
         for fr in results["fold_results"]:
-            all_rows.append({
+            new_rows.append({
                 "experiment": name,
                 "use_dino": ablation["use_dino_segmentation"],
                 "use_tabular": ablation["use_tabular"],
@@ -219,12 +363,16 @@ def run_cls_ablation():
                 "type": "fold",
             })
 
+        pred_fname = "test_predictions_cls_advanced" if advanced else "test_predictions_cls"
+        predictions_path = Path("outputs") / f"{pred_fname}_{name}.csv"
+
         print(f"\nEvaluating {name} on held-out test set ({len(df_test)} trees)...")
         test_m = _train_and_eval_test_cls(
-            df_train_val, df_test, cfg, results["fold_results"], device, cfg.num_classes
+            df_train_val, df_test, cfg, results["fold_results"], device, cfg.num_classes,
+            predictions_path=predictions_path,
         )
 
-        all_rows.append({
+        new_rows.append({
             "experiment": name,
             "use_dino": ablation["use_dino_segmentation"],
             "use_tabular": ablation["use_tabular"],
@@ -238,16 +386,19 @@ def run_cls_ablation():
             "type": "summary",
         })
 
+        all_rows.extend(new_rows)
+        done_experiments.add(name)
+
+        # Save immediately after each experiment — crash-safe
+        pd.DataFrame(all_rows).to_csv(output_path, index=False)
+
         print(f"\n {name} completed in {elapsed/60:.1f} min")
         print(f"CV  Accuracy = {summary['mean_val_acc']:.4f} ± {summary['std_val_acc']:.4f}")
         print(f"CV  F1 = {summary['mean_val_f1']:.4f} ± {summary['std_val_f1']:.4f}")
         print(f"Test Accuracy = {test_m['accuracy']:.4f} | Test F1 = {test_m['f1']:.4f}")
+        print(f"Results saved -> {output_path}")
 
     results_df = pd.DataFrame(all_rows)
-    output_path = Path("outputs") / "ablation_cls_results.csv"
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    results_df.to_csv(output_path, index=False)
-
     print("\n" + "=" * 60)
     print("CLASSIFICATION ABLATION COMPLETE")
     print("=" * 60)
@@ -263,4 +414,12 @@ def run_cls_ablation():
 
 
 if __name__ == "__main__":
-    run_cls_ablation()
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--advanced",
+        action="store_true",
+        help="Run advanced model ablations (ViT-Base, DINOv2-Base, DINOv2-Large) "
+             "instead of the original small-model ablations.",
+    )
+    args = parser.parse_args()
+    run_cls_ablation(advanced=args.advanced)
