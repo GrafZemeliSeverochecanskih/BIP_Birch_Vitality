@@ -16,20 +16,19 @@ def _interpolate_pos_embed(pos_embed_ckpt: torch.Tensor, model: nn.Module) -> to
     match.  This function interpolates the spatial patch tokens and leaves the CLS token
     untouched, exactly mirroring what timm does internally when pretrained=True.
     """
-    N_ckpt = pos_embed_ckpt.shape[1] - 1   # patches in checkpoint (exclude CLS)
+    N_ckpt  = pos_embed_ckpt.shape[1] - 1  # patches in checkpoint (exclude CLS)
     N_model = model.pos_embed.shape[1] - 1  # patches expected by model
 
     if N_ckpt == N_model:
         return pos_embed_ckpt  # no-op when sizes already match
 
-    cls_token  = pos_embed_ckpt[:, :1, :]   # [1, 1, D]
+    cls_token   = pos_embed_ckpt[:, :1, :]  # [1, 1, D]
     patch_embed = pos_embed_ckpt[:, 1:, :]  # [1, N_ckpt, D]
 
-    D = patch_embed.shape[-1]
-    H_old = W_old = int(N_ckpt ** 0.5)
+    D     = patch_embed.shape[-1]
+    H_old = W_old = int(N_ckpt  ** 0.5)
     H_new = W_new = int(N_model ** 0.5)
 
-    # Reshape to 2-D spatial grid, interpolate, flatten back
     patch_embed = patch_embed.reshape(1, H_old, W_old, D).permute(0, 3, 1, 2)  # [1,D,H,W]
     patch_embed = F.interpolate(patch_embed, size=(H_new, W_new), mode="bicubic", align_corners=False)
     patch_embed = patch_embed.permute(0, 2, 3, 1).reshape(1, H_new * W_new, D)  # [1,N_new,D]
@@ -38,48 +37,49 @@ def _interpolate_pos_embed(pos_embed_ckpt: torch.Tensor, model: nn.Module) -> to
     return torch.cat([cls_token, patch_embed], dim=1)
 
 
+def _load_dino_weights(model: nn.Module) -> None:
+    """
+    Download and apply pretrained DINO/DINOv2 weights to a timm ViT created with
+    pretrained=False.  Handles two issues that break plain load_state_dict:
+      1. norm.weight/bias → fc_norm.weight/bias key rename
+      2. pos_embed shape mismatch when img_size differs from pretraining resolution
+    """
+    pretrained_cfg = model.pretrained_cfg
+    if "hf_hub_id" in pretrained_cfg:
+        state_dict = timm.models.load_state_dict_from_hf(pretrained_cfg["hf_hub_id"])
+    else:
+        state_dict = timm.models.load_state_dict_from_url(pretrained_cfg["url"])
+
+    remapped = {}
+    for k, v in state_dict.items():
+        if k == "norm.weight":
+            k = "fc_norm.weight"
+        elif k == "norm.bias":
+            k = "fc_norm.bias"
+        remapped[k] = v
+
+    if "pos_embed" in remapped:
+        remapped["pos_embed"] = _interpolate_pos_embed(remapped["pos_embed"], model)
+
+    missing, unexpected = model.load_state_dict(remapped, strict=False)
+    if missing:
+        print(f"  [DINO load] missing keys (ok if head-related): {missing}")
+    if unexpected:
+        print(f"  [DINO load] unexpected keys (ok if head-related): {unexpected}")
+
+
 def get_backbone(name, pretrained=True, img_size=224):
     is_dino = ".dino" in name or "dinov2" in name
 
     if is_dino and pretrained:
-        # DINO-pretrained ViTs ship with "norm.weight/bias" but newer timm
-        # architectures expect "fc_norm.weight/bias".  We load the weights
-        # manually with key remapping to avoid the strict-loading error.
-        # img_size is passed explicitly so DINOv2 (default 518) works at 224.
         backbone = timm.create_model(
             name,
-            pretrained=False,       # don't auto-load yet
+            pretrained=False,
             num_classes=0,
             global_pool="avg",
             img_size=img_size,
         )
-        # Download the official pretrained state dict
-        pretrained_cfg = backbone.pretrained_cfg
-        state_dict = timm.models.load_state_dict_from_hf(
-            pretrained_cfg["hf_hub_id"],
-        ) if "hf_hub_id" in pretrained_cfg else timm.models.load_state_dict_from_url(
-            pretrained_cfg["url"],
-        )
-        # Remap norm -> fc_norm if the model expects fc_norm
-        remapped = {}
-        for k, v in state_dict.items():
-            new_key = k
-            if k == "norm.weight":
-                new_key = "fc_norm.weight"
-            elif k == "norm.bias":
-                new_key = "fc_norm.bias"
-            remapped[new_key] = v
-
-        # Interpolate position embeddings if checkpoint resolution != model resolution
-        if "pos_embed" in remapped:
-            remapped["pos_embed"] = _interpolate_pos_embed(remapped["pos_embed"], backbone)
-
-        # Drop head keys that don't exist (num_classes=0 removes the head)
-        missing, unexpected = backbone.load_state_dict(remapped, strict=False)
-        if missing:
-            print(f"  [DINO load] missing keys (ok if head-related): {missing}")
-        if unexpected:
-            print(f"  [DINO load] unexpected keys (ok if head-related): {unexpected}")
+        _load_dino_weights(backbone)
     else:
         backbone = timm.create_model(
             name,
@@ -160,13 +160,18 @@ class DINOSegmenter(nn.Module):
         self,
         model_name="vit_small_patch16_224.dino",
         threshold=0.6,
+        img_size=224,
     ):
         super().__init__()
+        is_dino = ".dino" in model_name or "dinov2" in model_name
         self.vit = timm.create_model(
             model_name,
-            pretrained=True,
-            num_classes=0
+            pretrained=False if is_dino else True,
+            num_classes=0,
+            img_size=img_size,
         )
+        if is_dino:
+            _load_dino_weights(self.vit)
         for p in self.vit.parameters():
             p.requires_grad = False
         self.vit.eval()
@@ -280,7 +285,7 @@ class BirchVitalityModel(nn.Module):
         super().__init__()
 
         self.segmenter = (
-            DINOSegmenter(dino_seg_model, dino_seg_threshold) if use_dino else None
+            DINOSegmenter(dino_seg_model, dino_seg_threshold, img_size=img_size) if use_dino else None
         )
 
         self.backbone, feature_dim = get_backbone(backbone_name, pretrained, img_size=img_size)
@@ -402,6 +407,7 @@ class BirchVitalityClassifier(nn.Module):
         dropout=0.3,
         pretrained=True,
         freeze_backbone=False,
+        img_size=224,
 
         use_dino=False,
         dino_seg_model: str = "vit_small_patch16_224.dino",
@@ -415,10 +421,10 @@ class BirchVitalityClassifier(nn.Module):
         self.num_classes = num_classes
 
         self.segmenter = (
-            DINOSegmenter(dino_seg_model, dino_seg_threshold) if use_dino else None
+            DINOSegmenter(dino_seg_model, dino_seg_threshold, img_size=img_size) if use_dino else None
         )
 
-        self.backbone, feature_dim = get_backbone(backbone_name, pretrained)
+        self.backbone, feature_dim = get_backbone(backbone_name, pretrained, img_size=img_size)
         self.aggregator = get_aggregator(aggregator_name, feature_dim)
 
         if freeze_backbone:
