@@ -248,7 +248,7 @@ def train_cls_fold(
         save_checkpoint(resume_path, model, optimizer, scheduler, epoch, early_stopping.best_loss, scaler=scaler)
 
     if checkpoint_path.exists():
-        model.load_state_dict(torch.load(checkpoint_path, weights_only=True))
+        model.load_state_dict(torch.load(checkpoint_path, weights_only=True), strict=False)
         print(f"Loaded best weights from {checkpoint_path}")
 
     # If no epochs ran this session (fully resumed), compute metrics from the loaded model
