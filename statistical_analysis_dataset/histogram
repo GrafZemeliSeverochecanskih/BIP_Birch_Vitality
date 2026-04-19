@@ -1,0 +1,31 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.stats import skew
+
+
+
+##data loading
+path = "C:/Users/Tkeli/Documents/BIP_project/Chargement_donnees/birch_trees_bratislava.csv"
+df = pd.read_csv(path, sep = ";")  
+
+
+df["vitality"] = df["vitality"].astype(str).str.replace(",", ".") #standardized
+
+
+df["vitality"] = pd.to_numeric(df["vitality"], errors="coerce")#number conversion
+
+
+##plotting
+sns.set_style("whitegrid")
+plt.figure(figsize=(8,5))
+sns.countplot(x="vitality", data=df, order=sorted(df["vitality"].unique()))
+plt.title("Distribution of vitality levels", fontsize= 18)
+plt.xlabel("Vitality level", fontsize= 15)
+plt.ylabel("Number of trees", fontsize= 15)
+
+plt.show()
+
+##skewness calculation
+sk = skew(df["vitality"])
+print("Skewness =", sk)
